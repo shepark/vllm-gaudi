@@ -42,6 +42,7 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.v1.attention.selector import get_attn_backend
+from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 from vllm.config import (VllmConfig, get_layers_from_vllm_config, update_config)
 from vllm.config.multimodal import ImageDummyOptions, VideoDummyOptions
@@ -472,34 +473,45 @@ def apply_model_specific_patches(model_runner):
     patch_llama4_get_attn_scale(model_runner.model)
 
 
-def compute_prefix_caching_block_indices(num_reqs: int, num_computed_tokens, num_scheduled_tokens,
-                                         mamba_block_size: int,
-                                         device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+class DictBackedAttentionMetadata(dict):
+    """A dict view over TrimmedAttentionMetadata/AttentionMetadata objects.
 
-    num_computed_tokens = torch.tensor(num_computed_tokens, dtype=torch.int32)
-    num_scheduled_tokens = torch.tensor(num_scheduled_tokens, dtype=torch.int32)
+    Qwen3.5 (qwen3_next) asserts `isinstance(attn_metadata, dict)`.
+    vllm-gaudi codepaths (e.g. process_metadata) expect attribute access and
+    namedtuple-like APIs (_replace/_asdict/_fields).
 
-    if num_computed_tokens.numel() > num_reqs:
-        num_computed_tokens = num_computed_tokens[:num_reqs]
-    if num_scheduled_tokens.numel() > num_reqs:
-        num_scheduled_tokens = num_scheduled_tokens[:num_reqs]
+    This wrapper satisfies both:
+      - It *is* a dict (passes isinstance(..., dict))
+      - Delegates attribute and namedtuple APIs to the original metadata
+    """
+    def __init__(self, md):
+        self._md = md
+        # Populate dict payload for code that actually indexes into the dict.
+        if hasattr(md, "_asdict"):
+            super().__init__(md._asdict())
+        else:
+            # best-effort: copy public attrs into dict
+            super().__init__({k: getattr(md, k) for k in dir(md)
+                              if not k.startswith("_") and hasattr(md, k)})
 
-    # Block index of the last computed token
-    block_idx_last_computed_token = cdiv(num_computed_tokens, mamba_block_size) - 1
-    # which is <= block index for the first scheduled token
-    block_idx_first_scheduled_token = (cdiv(num_computed_tokens + 1, mamba_block_size) - 1)
-    # which is <= block index of the last scheduled token
-    block_idx_last_scheduled_token = (cdiv(num_computed_tokens + num_scheduled_tokens, mamba_block_size) - 1)
-    # -1 in case it's non-computed and causes later issues with indexing
-    block_idx_last_computed_token = torch.clamp(block_idx_last_computed_token, min=0)
-    # -1 in the case we have a padded request (0 seq-len)
-    block_idx_last_scheduled_token = torch.clamp(block_idx_last_scheduled_token, min=0)
+    def __getattr__(self, name):
+        return getattr(self._md, name)
 
-    return (
-        block_idx_last_computed_token,
-        block_idx_first_scheduled_token,
-        block_idx_last_scheduled_token,
-    )
+    # Preserve namedtuple-like APIs used by gaudi helpers (custom_tuple_replace etc.)
+    def _replace(self, **kwargs):
+        new_md = self._md._replace(**kwargs)
+        return DictBackedAttentionMetadata(new_md)
+
+    def _asdict(self):
+        return self._md._asdict() if hasattr(self._md, "_asdict") else dict(self)
+
+    @property
+    def _fields(self):
+        return getattr(self._md, "_fields", ())
+
+    def __iter__(self):
+        # dict iteration semantics
+        return super().__iter__()
 
 
 class HpuKVConnectorModelRunnerMixin(KVConnectorModelRunnerMixin):
@@ -618,11 +630,22 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
             kwargs.pop('warmup_mode')
         input_ids = kwargs['input_ids']
         model_has_chunked_attention = kwargs.pop('model_has_chunked_attention', False)
-        if (not self.unified_attn) and ('attn_metadata' in kwargs and not self.pooling_model):
-            kwargs['attn_metadata'] = self.metadata_processor.process_metadata(kwargs['attn_metadata'],
-                                                                               input_ids.size(0), input_ids.size(1),
-                                                                               input_ids.device, self.dtype,
-                                                                               model_has_chunked_attention)
+#        if (not self.unified_attn) and ('attn_metadata' in kwargs and not self.pooling_model):
+#            kwargs['attn_metadata'] = self.metadata_processor.process_metadata(kwargs['attn_metadata'],
+#                                                                               input_ids.size(0), input_ids.size(1),
+#                                                                               input_ids.device, self.dtype,
+#                                                                               model_has_chunked_attention)
+
+        if (not self.unified_attn) and ('attn_metadata' in kwargs) and (not self.pooling_model):
+            # Qwen3.5 (qwen3_next GDN path) passes dict-like attn_metadata via
+            # forward_context. The HPU metadata processor expects a metadata object
+            # with attributes (e.g. is_prompt). Skip processing for dicts.
+            attn_md = kwargs.get('attn_metadata', None)
+            if not isinstance(attn_md, dict):
+                kwargs['attn_metadata'] = self.metadata_processor.process_metadata(
+                    attn_md, input_ids.size(0), input_ids.size(1),
+                    input_ids.device, self.dtype, model_has_chunked_attention)
+
         if self._rotary_prepare_cos_sin is not None:
             self._rotary_prepare_cos_sin(kwargs['positions'], recompute_cos_sin=self.recompute_cos_sin)
         attn_meta = kwargs.pop('attn_metadata', None)
@@ -736,9 +759,8 @@ def trim_attn_metadata(metadata: HPUAttentionMetadataV1) -> object:
         'slot_mapping', 'is_prompt', 'block_size', 'block_groups', 'window_block_list', 'window_block_mapping',
         'window_block_usage', 'window_block_groups', 'window_attn_bias', 'chunked_block_mapping', 'chunked_attn_bias',
         'chunked_block_list', 'chunked_block_usage', 'chunked_block_groups', 'prep_initial_states',
-        'has_initial_states_p', 'last_chunk_indices_p', 'load_indices_tensor', 'store_indices_tensor',
-        'query_start_loc', 'query_start_loc_p',
-        'padding_mask_flat', 'blocks_caching_range', 'mamba_chunks_to_block_mapping', 'seqlens_offsets_for_blocks'
+        'has_initial_states_p', 'last_chunk_indices_p', 'state_indices_tensor', 'query_start_loc', 'query_start_loc_p',
+        'padding_mask_flat'
     ])
     return attention_metadata
 
@@ -811,6 +833,33 @@ def with_thread_limits():
         return wrapper
 
     return decorator
+
+
+class _Qwen3AttnMetadataDict(dict):
+    """dict-like mapping: prefix -> (GDNAttentionMetadata or regular attn metadata).
+
+    qwen3_next uses a dict in forward_context.attn_metadata and indexes it with
+    module-specific prefixes. For Qwen3.5:
+      - linear_attn expects GDNAttentionMetadata
+      - normal attention backends expect metadata with seq_lens_tensor, etc.
+    We return the appropriate object based on the key.
+    """
+    def __init__(self, gdn_md: GDNAttentionMetadata, default_md: Any):
+        super().__init__()
+        self._gdn_md = gdn_md
+        self._default_md = default_md
+
+    def _select(self, key):
+        if isinstance(key, str) and ("linear_attn" in key):
+            return self._gdn_md
+        return self._default_md
+
+    def __missing__(self, key):
+        return self._select(key)
+
+    # Some code may use `.get()`; make it consistent with __getitem__/__missing__.
+    def get(self, key, default=None):
+        return self._select(key)
 
 
 class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
@@ -1073,6 +1122,152 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         assert not (self.unified_attn and not self.use_contiguous_pa), 'Unified attn requires contiguous_pa!'
         assert not (self.unified_attn and not self.use_merged_prefill), 'Unified attn requires merged_prefill!'
 
+    def _build_gdn_attn_metadata_from_trimmed(self, md) -> GDNAttentionMetadata:
+        """Build vLLM-upstream GDNAttentionMetadata from gaudi TrimmedAttentionMetadata.
+
+        This is a minimal, correctness-first builder for the common (non-spec) path.
+        """
+        # Useful fallbacks when query_start_loc is missing/None or inconsistent.
+        slot_mapping = getattr(md, "slot_mapping", None)
+        slot_n = None
+        if slot_mapping is not None and hasattr(slot_mapping, "numel"):
+            try:
+                slot_n = int(slot_mapping.numel())
+            except Exception:
+                slot_n = None
+
+        # query_start_loc: shape [B+1]
+        # NOTE: vllm-gaudi may leave query_start_loc(_p) as None unless
+        # num_mamba_layers > 0. Qwen3.5 GDN attention still needs it, so
+        # derive it from seq_lens/context_lens when missing.
+        qsl = getattr(md, "query_start_loc", None)
+        if qsl is None:
+            qsl = getattr(md, "query_start_loc_p", None)
+
+        # Derive query_start_loc if still missing/None.
+        if qsl is None:
+            seq_lens_tensor = getattr(md, "seq_lens_tensor", None)
+            ctx_lens_tensor = getattr(md, "context_lens_tensor", None)
+
+            if seq_lens_tensor is None:
+                # Last resort: use slot_mapping length as total tokens for a single seq.
+                if slot_n is None or slot_n == 0:
+                    raise RuntimeError(
+                        "TrimmedAttentionMetadata is missing query_start_loc and "
+                        "seq_lens_tensor; cannot derive query_start_loc"
+                    )
+                qsl = torch.tensor([0, slot_n], dtype=torch.int32, device=getattr(slot_mapping, "device", "cpu"))
+            else:
+                # Heuristic: some metadata variants already store query lengths in seq_lens_tensor.
+                if ctx_lens_tensor is None:
+                    qlens = seq_lens_tensor.to(torch.int32)
+                else:
+                    qlens = (seq_lens_tensor - ctx_lens_tensor).to(torch.int32)
+                    qlens = torch.clamp(qlens, min=0)
+                    # If subtraction yields all zeros but seq_lens_tensor is non-zero, treat seq_lens_tensor as qlens.
+                    try:
+                        if int(qlens.detach().cpu().sum().item()) == 0 and int(seq_lens_tensor.detach().cpu().sum().item()) > 0:
+                            qlens = seq_lens_tensor.to(torch.int32)
+                    except Exception:
+                        pass
+
+                # If we have slot_mapping and totals mismatch, force first seq to cover slot_n.
+                if slot_n is not None and slot_n > 0:
+                    try:
+                        qsum = int(qlens.detach().cpu().sum().item())
+                        if qsum != slot_n:
+                            qlens = torch.zeros_like(qlens, dtype=torch.int32)
+                            qlens[0] = slot_n
+                    except Exception:
+                        pass
+
+                qsl = torch.zeros(
+                    qlens.numel() + 1,
+                    dtype=torch.int32,
+                    device=seq_lens_tensor.device,
+                )
+                qsl[1:] = torch.cumsum(qlens, dim=0)
+
+        # Compute query lengths on CPU (avoid device scalar ops)
+        qsl_cpu = qsl.detach().cpu()
+        qlens_cpu = qsl_cpu[1:] - qsl_cpu[:-1]
+
+        # If qsl still results in 0 tokens but slot_mapping says otherwise, fix it.
+        if slot_n is not None and slot_n > 0:
+            try:
+                if int(qsl_cpu[-1].item()) == 0:
+                    qsl = torch.tensor([0, slot_n], dtype=torch.int32, device=qsl.device)
+                    qsl_cpu = qsl.detach().cpu()
+                    qlens_cpu = qsl_cpu[1:] - qsl_cpu[:-1]
+            except Exception:
+                pass
+
+        # Decide prompt vs decode using md.is_prompt when available.
+        is_prompt = getattr(md, "is_prompt", False)
+        if isinstance(is_prompt, torch.Tensor):
+            is_prompt = bool(is_prompt.detach().cpu().item())
+
+        num_actual_tokens = int(qsl_cpu[-1].item())
+
+        if is_prompt:
+            # prefill batch: treat all >0 query_lens as prefill
+            num_prefills = int((qlens_cpu > 0).sum().item())
+            num_prefill_tokens = num_actual_tokens
+            num_decodes = 0
+            num_decode_tokens = 0
+        else:
+            # decode batch: treat all >0 query_lens as decode (normally all ones)
+            num_decodes = int((qlens_cpu > 0).sum().item())
+            num_decode_tokens = num_actual_tokens
+            num_prefills = 0
+            num_prefill_tokens = 0
+
+        # Final safety: if we have actual tokens, ensure one of the branches is taken.
+        if num_actual_tokens > 0 and num_prefills == 0 and num_decodes == 0:
+            if is_prompt:
+                num_prefills = 1
+                num_prefill_tokens = num_actual_tokens
+            else:
+                num_decodes = 1
+                num_decode_tokens = num_actual_tokens
+
+        context_lens_tensor = getattr(md, "context_lens_tensor", None)
+        has_initial_state = None
+        if num_prefills > 0 and context_lens_tensor is not None:
+            has_initial_state = (context_lens_tensor > 0)
+
+        # For non-spec path, upstream sets non_spec_state_indices_tensor from block_table[:,0].
+        # On gaudi we already have state_indices_tensor that serves the same purpose.
+        non_spec_state_indices_tensor = getattr(md, "state_indices_tensor", None)
+        if non_spec_state_indices_tensor is None:
+            # fallback: [0..B-1]
+            B = int(qlens_cpu.numel())
+            non_spec_state_indices_tensor = torch.arange(
+                B, dtype=torch.int32, device=qsl.device
+            )
+
+        return GDNAttentionMetadata(
+            num_prefills=num_prefills,
+            num_prefill_tokens=num_prefill_tokens,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            num_spec_decodes=0,
+            num_spec_decode_tokens=0,
+            num_actual_tokens=num_actual_tokens,
+            has_initial_state=has_initial_state,
+            spec_query_start_loc=None,
+            non_spec_query_start_loc=qsl,
+            spec_state_indices_tensor=None,
+            non_spec_state_indices_tensor=non_spec_state_indices_tensor,
+            spec_sequence_masks=None,
+            spec_token_indx=None,
+            non_spec_token_indx=None,
+            num_accepted_tokens=None,
+            nums_dict=None,
+            batch_ptr=None,
+            token_chunk_offset_ptr=None,
+        )
+
     def _make_buffer(self, *size: Union[int, torch.SymInt], dtype: torch.dtype, numpy: bool = True) -> CpuGpuBuffer:
         return CpuGpuBuffer(*size, dtype=dtype, device=self.device, pin_memory=self.pin_memory, with_numpy=numpy)
 
@@ -1082,24 +1277,6 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         new_bucket = self.bucketing_manager.find_unified_bucket(query_len, shared_blocks, unique_blocks, is_causal)
         return (new_bucket[0], new_bucket[1], new_bucket[2], self.max_num_seqs)
-
-    def prepare_mamba_state_idxs(self, req_indices, block_table_offsets, target_bs):
-        num_indices = len(req_indices)
-        all_state_indices_cpu = []
-        for group_idx in range(len(self.input_batch.block_table.block_tables)):
-            block_table_cpu_tensor = self.input_batch.block_table[group_idx].get_cpu_tensor()
-            state_indices_cpu = block_table_cpu_tensor[req_indices, block_table_offsets].clone()
-
-            if num_indices < target_bs:
-                padding = torch.full((target_bs - num_indices, ),
-                                        self._MAMBA_PAD_BLOCK_ID,
-                                        dtype=torch.int32,
-                                        device='cpu')
-                state_indices_cpu = torch.cat([state_indices_cpu, padding])
-
-            all_state_indices_cpu.append(state_indices_cpu)
-
-        return torch.stack(all_state_indices_cpu, dim=0)  # Shape: [num_groups, target_bs]
 
     def create_lora_mask(self, input_tokens: torch.Tensor, lora_ids: list[int], is_prompt: bool):
         '''
@@ -2052,12 +2229,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             target_bs * target_seq <= self.max_num_tokens
 
     def _get_attention_group_id_for_hybrid(self):
-        if self.num_mamba_layers == 0 or len(self.kv_cache_config.kv_cache_groups) == 0:
+        if len(self.kv_cache_config.kv_cache_groups) == 0:
             return 0
 
         for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
             if isinstance(group.kv_cache_spec, AttentionSpec):
                 return gid
+
+        # fallback: if no AttentionSpec group is found, keep legacy behavior
+        return 0
 
     def _extract_prefill_batch_contents(self, num_prefills, num_decodes, num_scheduled_tokens, warmup=False):
         # DECODES are the first num_decodes REQUESTS.
@@ -2279,66 +2459,29 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 assert this_new_tokens == 0
                 last_chunk_indices.append(last_chunk_index)
 
-            mamba_block_size = self.cache_config.mamba_block_size
-            block_idx_last_computed_token_cpu, block_idx_first_scheduled_token_cpu, block_idx_last_scheduled_token_cpu = \
-                compute_prefix_caching_block_indices(
-                    len(contents.req_ids),
-                    context_lens,
-                    query_lens,
-                    mamba_block_size,
-                    self.device
-                )
+            num_prefill_reqs = len(contents.req_ids)
+            all_state_indices_cpu = []
+            for group_idx in range(len(self.input_batch.block_table.block_tables)):
+                block_table_cpu_tensor = self.input_batch.block_table[group_idx].get_cpu_tensor()
 
-            req_indices = [self.input_batch.req_id_to_index[req_id] for req_id in contents.req_ids]
-            if self.use_prefix_caching:
-                load_state_indices_cpu = self.prepare_mamba_state_idxs(req_indices, block_idx_last_computed_token_cpu, target_bs)
-                store_state_indices_cpu = self.prepare_mamba_state_idxs(req_indices, block_idx_last_scheduled_token_cpu, target_bs)
-            else:
-                zeros = [0] * len(req_indices)
-                load_state_indices_cpu = store_state_indices_cpu = \
-                    self.prepare_mamba_state_idxs(req_indices, zeros, target_bs)
+                state_indices_cpu = torch.zeros(num_prefill_reqs, dtype=torch.int32)
 
-            if self.use_prefix_caching:
-                assert len(contents.req_ids) == 1
-                assert mamba_block_size % self.mamba_chunk_size == 0
-                assert context_lens[0] % self.mamba_chunk_size == 0
+                for i, req_id in enumerate(contents.req_ids):
+                    req_idx = self.input_batch.req_id_to_index[req_id]
+                    # Get the first block for this request (same logic as decode)
+                    first_block = block_table_cpu_tensor[req_idx, 0]
+                    state_indices_cpu[i] = first_block
 
-                num_chunks = cdiv(query_lens[0], self.mamba_chunk_size)
-                chunk_stride = mamba_block_size // self.mamba_chunk_size
-                chunk_offset = (context_lens[0] // self.mamba_chunk_size) % chunk_stride
+                if num_prefill_reqs < target_bs:
+                    padding = torch.full((target_bs - num_prefill_reqs, ),
+                                         self._MAMBA_PAD_BLOCK_ID,
+                                         dtype=torch.int32,
+                                         device='cpu')
+                    state_indices_cpu = torch.cat([state_indices_cpu, padding])
 
-                all_blocks_caching_ranges_cpu = []
-                all_mamba_chunks_to_block_mappings_cpu = []
-                for group_idx in range(len(self.input_batch.block_table.block_tables)):
-                    block_table_cpu_tensor = self.input_batch.block_table[group_idx].get_cpu_tensor()
-                    first = block_idx_first_scheduled_token_cpu[0]
-                    last = block_idx_last_scheduled_token_cpu[0]
-                    blocks_caching_range = block_table_cpu_tensor[req_indices[0], first : last + 1].clone()
+                all_state_indices_cpu.append(state_indices_cpu)
 
-                    mamba_chunks_to_block_mapping_cpu = torch.full((num_chunks, ),
-                                                    self._MAMBA_PAD_BLOCK_ID,
-                                                    dtype=torch.int32,
-                                                    device='cpu')
-
-                    mamba_chunks_to_block_mapping_cpu[chunk_offset::chunk_stride] = blocks_caching_range
-
-                    all_blocks_caching_ranges_cpu.append(blocks_caching_range)
-                    all_mamba_chunks_to_block_mappings_cpu.append(mamba_chunks_to_block_mapping_cpu)
-
-                all_blocks_caching_ranges_cpu = torch.stack(all_blocks_caching_ranges_cpu, dim=0)
-                all_mamba_chunks_to_block_mappings_cpu = torch.stack(all_mamba_chunks_to_block_mappings_cpu, dim=0)
-
-                computed_tokens = context_lens[0]
-                scheduled_tokens = query_lens[0]
-                total_tokens = computed_tokens + scheduled_tokens
-                offset = mamba_block_size - computed_tokens % mamba_block_size
-                seqlens_offsets_for_blocks_cpu = []
-                while offset < total_tokens:
-                    seqlens_offsets_for_blocks_cpu.append(offset)
-                    offset += mamba_block_size
-                seqlens_offsets_for_blocks_cpu.append(total_tokens)
-                seqlens_offsets_for_blocks_cpu = torch.tensor(seqlens_offsets_for_blocks_cpu, dtype=torch.int32, device='cpu')
-
+            all_state_indices_cpu = torch.stack(all_state_indices_cpu, dim=0)  # Shape: [num_groups, target_bs]
 
             # CREATE PADDING MASK HERE using target_bs and target_seq
             # Create mask on CPU: [target_bs, target_seq]
@@ -2358,8 +2501,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             # Flatten to [target_bs * target_seq, 1] for easy multiplication
             padding_mask_flat_cpu = padding_mask_cpu.view(-1, 1)
 
-            load_indices_tensor = async_h2d_copy(load_state_indices_cpu, device=self.device)
-            store_indices_tensor = async_h2d_copy(store_state_indices_cpu, device=self.device)
+            state_indices_tensor = async_h2d_copy(all_state_indices_cpu, device=self.device)
 
             has_initial_states_p = async_h2d_copy(has_initial_states_cpu, dtype=torch.int32)
             last_chunk_indices_p = async_h2d_copy(last_chunk_indices, dtype=torch.int32)
@@ -2367,26 +2509,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             padding_mask_flat = async_h2d_copy(padding_mask_flat_cpu, device=self.device)
             query_start_loc_p = async_h2d_copy(query_start_loc_p_cpu, dtype=torch.int32)
 
-            if self.use_prefix_caching:
-                blocks_caching_range = async_h2d_copy(all_blocks_caching_ranges_cpu, device=self.device)
-                mamba_chunks_to_block_mapping = async_h2d_copy(all_mamba_chunks_to_block_mappings_cpu, device=self.device)
-                seqlens_offsets_for_blocks = async_h2d_copy(seqlens_offsets_for_blocks_cpu, device=self.device)
-            else:
-                blocks_caching_range = None
-                mamba_chunks_to_block_mapping = None
-                seqlens_offsets_for_blocks = None
-
         else:
             prep_initial_states = None
-            load_indices_tensor = None
-            store_indices_tensor = None
+            state_indices_tensor = None
             has_initial_states_p = None
             last_chunk_indices_p = None
             padding_mask_flat = None
             query_start_loc_p = None
-            blocks_caching_range = None
-            mamba_chunks_to_block_mappings = None
-            seqlens_offsets_for_blocks = None
 
         query_lens = async_h2d_copy(query_lens, dtype=torch.int32)
         token_ids = async_h2d_copy(token_ids, dtype=torch.int32)
@@ -2406,13 +2535,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                                      prep_initial_states=prep_initial_states,
                                                                      has_initial_states_p=has_initial_states_p,
                                                                      last_chunk_indices_p=last_chunk_indices_p,
-                                                                     load_indices_tensor=load_indices_tensor,
-                                                                     store_indices_tensor=store_indices_tensor,
+                                                                     state_indices_tensor=state_indices_tensor,
                                                                      query_start_loc=query_start_loc_p,
-                                                                     padding_mask_flat=padding_mask_flat,
-                                                                     blocks_caching_range=blocks_caching_range,
-                                                                     mamba_chunks_to_block_mapping=mamba_chunks_to_block_mapping,
-                                                                     seqlens_offsets_for_blocks=seqlens_offsets_for_blocks)
+                                                                     padding_mask_flat=padding_mask_flat)
         return PrefillInputData(request_ids=[req_ids],
                                 prompt_lens=[query_lens],
                                 token_ids=[token_ids],
@@ -2639,24 +2764,20 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     padded_batch_size * num_tokens)
 
         if self.num_mamba_layers > 0:
-            mamba_block_size = self.cache_config.mamba_block_size
-            block_idx_last_computed_token_cpu, block_idx_first_scheduled_token_cpu, block_idx_last_scheduled_token_cpu = \
-                compute_prefix_caching_block_indices(
-                    num_decodes,
-                    context_lens,
-                    num_scheduled_tokens,-
-                    mamba_block_size,
-                    self.device
-                )
+            all_state_indices_cpu = []
+            for group_idx in range(len(self.input_batch.block_table.block_tables)):
+                block_table_cpu_tensor = self.input_batch.block_table[group_idx].get_cpu_tensor()
+                state_indices_cpu = block_table_cpu_tensor[:num_decodes, 0].clone()
+                if num_decodes < padded_batch_size:
+                    padding = torch.full((padded_batch_size - num_decodes, ),
+                                         self._MAMBA_PAD_BLOCK_ID,
+                                         dtype=torch.int32,
+                                         device='cpu')
+                    state_indices_cpu = torch.cat([state_indices_cpu, padding])
 
-            req_indices = list(range(num_decodes))
-            if self.use_prefix_caching:
-                load_state_indices_cpu = self.prepare_mamba_state_idxs(req_indices, block_idx_last_computed_token_cpu, padded_batch_size)
-                store_state_indices_cpu = self.prepare_mamba_state_idxs(req_indices, block_idx_last_scheduled_token_cpu, padded_batch_size)
-            else:
-                zeros = [0] * len(req_indices)
-                load_state_indices_cpu = store_state_indices_cpu = \
-                    self.prepare_mamba_state_idxs(req_indices, zeros, padded_batch_size)
+                all_state_indices_cpu.append(state_indices_cpu)
+
+            all_state_indices_cpu = torch.stack(all_state_indices_cpu, dim=0)  # Shape: [num_groups, target_bs]
 
             seq_lens_cpu = torch.tensor(num_tokens_per_req, dtype=torch.int32, device='cpu', pin_memory=self.pin_memory)
 
@@ -2667,22 +2788,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             query_start_loc_p_cpu[1:] = torch.cumsum(seq_lens_cpu.clone().to(dtype=torch.int32), dim=0)
 
             seq_lens_tensor = async_h2d_copy(seq_lens_cpu, device=self.device)
-            load_indices_tensor = async_h2d_copy(load_state_indices_cpu, device=self.device)
-            store_indices_tensor = async_h2d_copy(store_state_indices_cpu, device=self.device)
+            state_indices_tensor = async_h2d_copy(all_state_indices_cpu, device=self.device)
             query_start_loc_p = async_h2d_copy(query_start_loc_p_cpu, dtype=torch.int32)
-
-            block_idx_last_computed_token = async_h2d_copy(block_idx_last_computed_token_cpu, device=self.device)
-            block_idx_first_scheduled_token = async_h2d_copy(block_idx_first_scheduled_token_cpu, device=self.device)
-            block_idx_last_scheduled_token = async_h2d_copy(block_idx_last_scheduled_token_cpu, device=self.device)
 
         else:
             seq_lens_tensor = None
-            load_indices_tensor = None
-            store_indices_tensor = None
+            state_indices_tensor = None
             query_start_loc_p = None
-            block_idx_last_computed_token = None
-            block_idx_first_scheduled_token = None
-            block_idx_last_scheduled_token = None
 
         # CPU<>HPU sync *should not* happen here.
         block_list_device = async_h2d_copy(block_list, device=self.device)
@@ -2744,8 +2856,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             chunked_block_list=chunked_block_list_device,
             chunked_block_usage=chunked_block_usage_device,
             chunked_block_groups=chunked_block_groups_device,
-            load_indices_tensor=load_indices_tensor,
-            store_indices_tensor=store_indices_tensor,
+            state_indices_tensor=state_indices_tensor,
             seq_lens_tensor=seq_lens_tensor,
             query_start_loc=query_start_loc_p,
         )
@@ -3115,6 +3226,26 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         if not seen and not warmup_mode:
             logger.warning("Configuration: %s was not warmed-up!", cfg)
 
+    def _unwrap_model_for_introspection(self, m, max_depth: int = 8):
+        cur = m
+        for _ in range(max_depth):
+            if cur is None:
+                break
+            nxt = None
+            for attr in ("model", "module", "base_model", "language_model"):
+                if hasattr(cur, attr):
+                    nxt = getattr(cur, attr)
+                    break
+            if nxt is None or nxt is cur:
+                break
+            cur = nxt
+        return cur
+
+    def _needs_dict_attn_metadata(self) -> bool:
+        base = self._unwrap_model_for_introspection(self.model)
+        name = f"{type(base).__module__}.{type(base).__name__}".lower()
+        return ("qwen3_next" in name) or ("qwen3_5" in name)
+
     def _execute_model_generic(self,
                                token_ids,
                                position_ids,
@@ -3146,6 +3277,17 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         if self.model_has_chunked_attention:
             additional_kwargs.update({"model_has_chunked_attention": True})
         trimmed_attn_metadata = attn_metadata if self.unified_attn else trim_attn_metadata(attn_metadata)
+
+        # Keep gaudi internal metadata object unchanged.
+        model_attn_metadata = trimmed_attn_metadata
+
+        # Qwen3.5 (qwen3_next) requires forward_context.attn_metadata to be:
+        #   dict[prefix -> (GDNAttentionMetadata for linear_attn, regular metadata otherwise)]
+        # See qwen3_next._forward_core: assert dict, then index by self.prefix. :contentReference[oaicite:2]{index=2}
+        if self._needs_dict_attn_metadata():
+            gdn_md = self._build_gdn_attn_metadata_from_trimmed(trimmed_attn_metadata)
+            model_attn_metadata = _Qwen3AttnMetadataDict(gdn_md, trimmed_attn_metadata)
+
         if self.is_driver_worker:
             model_event_name = ("model_forward_"
                                 f"bs{batch_size}_"
@@ -3157,7 +3299,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         with self.profiler.record_event('internal', model_event_name):
             hidden_states = self.model.forward(input_ids=token_ids,
                                                positions=position_ids,
-                                               attn_metadata=trimmed_attn_metadata,
+                                               attn_metadata=model_attn_metadata,
                                                kv_caches=kv_caches,
                                                inputs_embeds=inputs_embeds,
                                                model_mm_kwargs=model_mm_kwargs,
@@ -5392,7 +5534,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
     def warmup_multimodal_graphs(self, buckets):
 
         phase = 'Graph/Multimodal'
-        from vllm.multimodal.budget import MultiModalBudget
+        from vllm.multimodal.encoder_budget import MultiModalBudget
         self.mm_budget = MultiModalBudget(
             self.vllm_config,
             self.mm_registry,

@@ -130,17 +130,25 @@ def hpu_causal_conv1d_fn(
     bias: torch.Tensor | None,
     conv_states: torch.Tensor | None,
     query_start_loc: torch.Tensor,
-    load_cache_indices: torch.Tensor | None = None,
-    enable_prefix_caching: bool = False,
-    store_cache_indices: torch.Tensor | None = None,
-    blocks_caching_range: torch.Tensor | None = None,
-    seqlens_offsets_for_blocks: torch.Tensor | None = None,
+    cache_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
     activation: str | None = "silu",
+    block_idx_first_scheduled_token: torch.Tensor | None = None,
+    block_idx_last_scheduled_token: torch.Tensor | None = None,
+    initial_state_idx: torch.Tensor | None = None,
+    num_computed_tokens: torch.Tensor | None = None,
+    block_size_to_align: int = 0,
     metadata=None,
     validate_data: bool = False,
     is_prompt: bool = True,
 ):
+    if any(ptr is not None for ptr in (
+            block_idx_first_scheduled_token,
+            block_idx_last_scheduled_token,
+            initial_state_idx,
+            num_computed_tokens,
+    )):
+        raise NotImplementedError("Prefix caching metadata is not supported in the PyTorch reference implementation.")
 
     activation = _normalize_activation(activation)
     original_dtype = x.dtype
@@ -175,10 +183,19 @@ def hpu_causal_conv1d_fn(
             raise ValueError("'bias' must match the feature dimension.")
         if not ((x_work.stride(0) == 1) or (x_work.stride(1) == 1)):
             raise ValueError("Input tensor must be in channel-last or channel-first memory layout.")
+        if cache_indices is not None and cache_indices.numel() != padded_batch:
+            raise ValueError("'cache_indices' must align with the batch dimension implied by 'query_start_loc'.")
         if has_initial_state is not None and has_initial_state.numel() != padded_batch:
             raise ValueError("'has_initial_state' must align with 'query_start_loc'.")
 
     weight_dw = _make_depthwise_weight(weight_work)
+
+    # Get cache indices
+    if cache_indices is None:
+        batch_cache_idx = torch.arange(padded_batch, device=x_work.device, dtype=torch.long)
+    else:
+        # Ensure cache_indices is on the correct device
+        batch_cache_idx = cache_indices.to(x_work.device) if cache_indices.device != x_work.device else cache_indices
 
     # Take all input data for this call
     # Create tensor to get all data from 0 to lest sequence
@@ -197,21 +214,9 @@ def hpu_causal_conv1d_fn(
 
     # Prepare input for convolution
     seq_input = torch.cat([init_state, seq_x], dim=1)
-    if enable_prefix_caching:
-        offset = torch.arange(state_len, device=x.device)  # [state_len]
-        indices = seqlens_offsets_for_blocks.unsqueeze(1) + offset  # [N, state_len]
-
-        # Gather all slices at once: seq_input is [dim, seq_len], indices is [N, state_len]
-        # Result: [dim, N, state_len]
-        new_states = seq_input[:, indices].permute(1, 0, 2)  # -> [N, dim, state_len]
-
-        # Scatter all updates at once
-        conv_states[blocks_caching_range, :, -state_len:] = new_states
-    else:
-        end = qsl[-1]
-        idx = torch.arange(state_len, device=x.device) + end
-        new_state = seq_input.index_select(dim=1, index=idx)
-        conv_states[store_cache_indices, :, -state_len:] = new_state
+    end = qsl[-1]
+    idx = torch.arange(state_len, device=x.device) + end
+    new_state = seq_input.index_select(dim=1, index=idx)
 
     # Apply convolution
     seq_input = seq_input.unsqueeze(0)
@@ -232,17 +237,19 @@ def hpu_causal_conv1d_update(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
     activation: bool | str | None = None,
-    load_cache_indices: torch.Tensor | None = None,
-    store_cache_indices: torch.Tensor | None = None,
+    conv_state_indices: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
     max_query_len: int = -1,
     pad_slot_id: int = PAD_SLOT_ID,
+    block_idx_last_scheduled_token: torch.Tensor | None = None,
     initial_state_idx: torch.Tensor | None = None,
     validate_data: bool = False,
 ):
     if num_accepted_tokens is not None:
         raise NotImplementedError("Speculative decoding updates are not supported in the reference implementation.")
+    if block_idx_last_scheduled_token is not None or initial_state_idx is not None:
+        raise NotImplementedError("Prefix caching metadata is not supported in the reference implementation.")
     if max_query_len not in (-1, None):  # Provided only for Triton helper parity
         raise NotImplementedError("'max_query_len' is not used in the reference implementation.")
 
@@ -257,8 +264,7 @@ def hpu_causal_conv1d_update(
         bias,
         conv_state,
         qsl,
-        load_cache_indices=load_cache_indices,
-        store_cache_indices=store_cache_indices,
+        cache_indices=conv_state_indices,
         has_initial_state=None,
         activation=activation,
         metadata=None,
@@ -275,14 +281,25 @@ def hpu_causal_conv1d_fn_update(
     bias: torch.Tensor | None,
     conv_states: torch.Tensor | None,
     query_start_loc: torch.Tensor,
-    load_cache_indices: torch.Tensor | None = None,
-    store_cache_indices: torch.Tensor | None = None,
+    cache_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
     activation: str | None = "silu",
+    block_idx_first_scheduled_token: torch.Tensor | None = None,
+    block_idx_last_scheduled_token: torch.Tensor | None = None,
+    initial_state_idx: torch.Tensor | None = None,
+    num_computed_tokens: torch.Tensor | None = None,
+    block_size_to_align: int = 0,
     metadata=None,
     validate_data: bool = False,
     is_prompt: bool = True,
 ):
+    if any(ptr is not None for ptr in (
+            block_idx_first_scheduled_token,
+            block_idx_last_scheduled_token,
+            initial_state_idx,
+            num_computed_tokens,
+    )):
+        raise NotImplementedError("Prefix caching metadata is not supported in the PyTorch reference implementation.")
 
     activation = _normalize_activation(activation)
     original_dtype = x.dtype
@@ -302,12 +319,76 @@ def hpu_causal_conv1d_fn_update(
 
     # Keep on GPU - compute sequence info using tensor operations
     padded_batch = qsl.numel() - 1
+
+    # The update path expects x_work to be 3D: (padded_batch, dim, cu_seqlen).
+    # However, _flatten_inputs_for_update() may return a 2D "flat" tensor.
+    # Normalize 2D -> 3D here.
+    if x_work.dim() == 2:
+        dim_w = int(weight_work.size(0))
+        # Accept (dim, total_tokens) or (total_tokens, dim)
+        if x_work.size(0) == dim_w:
+            flat = x_work
+        elif x_work.size(1) == dim_w:
+            flat = x_work.transpose(0, 1).contiguous()
+        else:
+            raise ValueError(
+                f"Unexpected x shape {tuple(x_work.shape)} for dim={dim_w}"
+            )
+
+        lens = (qsl[1:] - qsl[:-1])
+        if lens.numel() == 0:
+            raise ValueError("Empty query_start_loc for causal_conv1d update.")
+        # Reference impl currently assumes uniform length across sequences.
+        if not torch.all(lens == lens[0]):
+            raise NotImplementedError(
+                "Varlen update is not supported in the PyTorch reference implementation."
+            )
+        L = int(lens[0].item())
+        total_tokens = int(flat.size(1))
+        if L <= 0:
+            raise ValueError(f"Invalid per-seq length {L} from query_start_loc.")
+        if total_tokens != padded_batch * L:
+            raise ValueError(
+                f"Token count mismatch: total_tokens={total_tokens} vs "
+                f"padded_batch*L={padded_batch}*{L}={padded_batch*L}"
+            )
+        # (dim, padded_batch*L) -> (padded_batch, dim, L)
+        x_work = flat.view(dim_w, padded_batch, L).permute(1, 0, 2).contiguous()
+
+    if x_work.dim() != 3:
+        raise ValueError(f"Expected 3D x_work, got {x_work.dim()}D")
+
     _, dim, cu_seqlen = x_work.shape
     _, width = weight_work.shape
     state_len = max(width - 1, 0)
 
     if validate_data:
-        if x_work.dim() != 2:
+        # Normalize x to 2D (dim, cu_seq_len).
+        # Upstream callers (e.g. qwen3_next decode/update) may provide:
+        #   - (batch, dim) or (batch, dim, 1)
+        #   - (dim, batch) or (dim, batch, 1)
+        # The reference update impl expects 2D (dim, cu_seq_len).
+        dim = int(weight_work.size(0))
+        if x.dim() == 3:
+            # (batch, dim, L) -> (dim, batch*L)
+            if x.size(1) == dim:
+                x = x.permute(1, 0, 2).contiguous().view(dim, -1)
+            # (dim, batch, L) -> (dim, batch*L)
+            elif x.size(0) == dim:
+                x = x.contiguous().view(dim, -1)
+            # (batch, L, dim) -> (dim, batch*L)
+            elif x.size(2) == dim:
+                x = x.permute(2, 0, 1).contiguous().view(dim, -1)
+            else:
+                raise ValueError(f"Unexpected 3D x shape {tuple(x.shape)} for dim={dim}.")
+        elif x.dim() == 2:
+            # (batch, dim) -> (dim, batch)
+            if x.size(1) == dim and x.size(0) != dim:
+                x = x.transpose(0, 1).contiguous()
+            # already (dim, cu_seq_len) or (dim, batch)
+            elif x.size(0) != dim:
+                raise ValueError(f"Unexpected 2D x shape {tuple(x.shape)} for dim={dim}.")
+        else:
             raise ValueError("'x' must be 2-D (dim, cu_seq_len).")
         if weight_work.shape != (dim, width):
             raise ValueError("'weight' must have shape (dim, width).")
@@ -315,6 +396,8 @@ def hpu_causal_conv1d_fn_update(
             raise ValueError("'bias' must match the feature dimension.")
         if not ((x_work.stride(0) == 1) or (x_work.stride(1) == 1)):
             raise ValueError("Input tensor must be in channel-last or channel-first memory layout.")
+        if cache_indices is not None and cache_indices.numel() != padded_batch:
+            raise ValueError("'cache_indices' must align with the batch dimension implied by 'query_start_loc'.")
         if has_initial_state is not None and has_initial_state.numel() != padded_batch:
             raise ValueError("'has_initial_state' must align with 'query_start_loc'.")
 
