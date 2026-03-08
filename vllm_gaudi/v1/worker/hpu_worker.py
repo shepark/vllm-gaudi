@@ -45,6 +45,61 @@ logger = init_logger()
 if TYPE_CHECKING:
     from vllm.v1.core.scheduler import GrammarOutput, SchedulerOutput
 
+# --- Q35 debug helpers ---
+_Q35_DBG = os.getenv("VLLM_GAUDI_Q35_DEBUG", "0") == "1"
+_Q35_DBG_LIMIT = int(os.getenv("VLLM_GAUDI_Q35_DEBUG_LIMIT", "20"))
+_q35_dbg_count = 0
+
+def _q35_dbg(msg: str, *args):
+    global _q35_dbg_count
+    if (not _Q35_DBG) or (_q35_dbg_count >= _Q35_DBG_LIMIT):
+        return
+    _q35_dbg_count += 1
+    logger.info("[Q35DBG %d] " + msg, _q35_dbg_count, *args)
+
+def _tinfo(t):
+    if t is None:
+        return "None"
+    try:
+        return f"shape={tuple(t.shape)} stride={tuple(t.stride())} contig={t.is_contiguous()} dtype={t.dtype} dev={t.device}"
+    except Exception:
+        return repr(t)
+# --- end ---
+
+def _patch_qwen3_next_rearrange_debug():
+    if not _Q35_DBG:
+        return
+    try:
+        import vllm.model_executor.models.qwen3_next as q3n
+    except Exception as e:
+        _q35_dbg("failed to import qwen3_next for debug: %r", e)
+        return
+
+    def _wrap_method(cls):
+        orig = getattr(cls, "rearrange_mixed_qkv", None)
+        if orig is None:
+            return
+        if getattr(orig, "_q35_wrapped", False):
+            return
+
+        def wrapped(self, mixed_qkv, *args, **kwargs):
+            shp = tuple(mixed_qkv.shape) if hasattr(mixed_qkv, "shape") else None
+
+            mode = "decode" if (shp is not None and len(shp) >= 2 and shp[1] == 1) else "prompt?"
+
+            _q35_dbg("rearrange_mixed_qkv ENTER mode=%s prefix=%r mixed_qkv %s",
+                     mode, getattr(self, "prefix", None), _tinfo(mixed_qkv))
+            return orig(self, mixed_qkv, *args, **kwargs)
+
+        wrapped._q35_wrapped = True
+        setattr(cls, "rearrange_mixed_qkv", wrapped)
+
+    for name, obj in vars(q3n).items():
+        if isinstance(obj, type) and hasattr(obj, "rearrange_mixed_qkv"):
+            _wrap_method(obj)
+
+    _q35_dbg("patched rearrange_mixed_qkv debug wrappers in qwen3_next")
+
 
 def _patch_vllm_fla_gated_delta_rule_to_torch() -> None:
     """Replace CUDA/Triton FLA gated-delta-rule ops with a torch reference on HPU.
@@ -343,6 +398,43 @@ def _patch_qwen3_next_gdn_gating_torch_fallback() -> None:
 # Apply patch early in worker process import.
 _patch_qwen3_next_gdn_gating_torch_fallback()
 
+
+def _patch_qwen3_next_sparse_moe_block_flatten_hidden_states() -> None:
+    """Make Qwen3NextSparseMoeBlock robust to 3D hidden_states on HPU.
+
+    Upstream Qwen3NextSparseMoeBlock.forward assumes hidden_states is 2D:
+        num_tokens, hidden_dim = hidden_states.shape
+    but on HPU runner we can see 3D tensors (e.g. [B, L, H]) especially in decode.
+    Flatten to 2D, call original forward, then reshape back.
+    """
+    try:
+        from vllm.model_executor.models import qwen3_next as q3n
+    except Exception:
+        return
+
+    if getattr(q3n, "_VLLM_GAUDI_PATCHED_QWEN3NEXT_SPARSE_MOE_3D", False):
+        return
+
+    cls = getattr(q3n, "Qwen3NextSparseMoeBlock", None)
+    if cls is None:
+        return
+
+    orig_forward = cls.forward
+
+    def forward(self, hidden_states: torch.Tensor):
+        # Accept 1D/2D/3D. Flatten all but last dim.
+        orig_shape = hidden_states.shape
+        hidden_dim = hidden_states.shape[-1]
+        hs2d = hidden_states.reshape(-1, hidden_dim)
+        out2d = orig_forward(self, hs2d)
+        return out2d.reshape(orig_shape)
+
+    cls.forward = forward
+    q3n._VLLM_GAUDI_PATCHED_QWEN3NEXT_SPARSE_MOE_3D = True
+
+_patch_qwen3_next_sparse_moe_block_flatten_hidden_states()
+
+
 def _patch_vllm_mamba_causal_conv1d_to_gaudi_pytorch() -> None:
     """Route vLLM upstream Mamba causal_conv1d ops to Gaudi PyTorch impl.
 
@@ -362,6 +454,52 @@ def _patch_vllm_mamba_causal_conv1d_to_gaudi_pytorch() -> None:
 
     if getattr(cv, "_VLLM_GAUDI_PATCHED_CAUSAL_CONV1D", False):
         return
+
+    def _normalize_mixed_qkv_out(out: torch.Tensor | None,
+                                weight: torch.Tensor) -> torch.Tensor | None:
+        """Normalize causal_conv1d outputs to shape (num_tokens, dim).
+
+        qwen3_next.rearrange_mixed_qkv() does torch.split(..., dim=-1) with sizes
+        [1024, 1024, 2048], so last-dim must be 4096 (feature dim).
+
+        Our gaudi reference paths can return:
+          - prompt: (dim, L)
+          - decode/update: (B, dim, L) (often L=1)
+        We normalize to:
+          - (L, dim) for prompt
+          - (B*L, dim) for update
+        """
+        if out is None:
+            return None
+        dim = int(weight.size(0))
+
+        # 3D: (B, dim, L) or (B, L, dim) -> (B*L, dim)
+        if out.dim() == 3:
+            if out.size(1) == dim:
+                # (B, dim, L) -> (B, L, dim)
+                out = out.permute(0, 2, 1).contiguous()
+            elif out.size(2) == dim:
+                # already (B, L, dim)
+                out = out.contiguous()
+            else:
+                # unexpected layout; keep as-is (will likely fail loudly later)
+                return out
+
+            # If L == 1, squeeze the L dimension
+            if out.size(1) == 1:
+                return out[:, 0, :]
+            # else flatten tokens
+            return out.view(-1, dim)
+
+        # 2D: (dim, L) or (L, dim) -> (L, dim)
+        if out.dim() == 2:
+            if out.size(0) == dim and out.size(1) != dim:
+                # (dim, L) -> (L, dim)
+                return out.transpose(0, 1).contiguous()
+            # if already (L, dim), just ensure last dim is dim
+            return out
+
+        return out
 
     # Wrap upstream signatures -> gaudi reference impl.
     def _hpu_causal_conv1d_fn(
@@ -415,7 +553,24 @@ def _patch_vllm_mamba_causal_conv1d_to_gaudi_pytorch() -> None:
             validate_data=validate_data,
             is_prompt=True,
         )
+        # Normalize to (num_tokens, dim) for qwen3_next split().
+        # out = _normalize_mixed_qkv_out(out, weight)
+        _q35_dbg("before: causal_conv1d_fn OUT %s | x %s | w %s | conv_states %s | qsl %s",
+                  _tinfo(out), _tinfo(x), _tinfo(weight), _tinfo(conv_states), _tinfo(query_start_loc))
+        # ---- Qwen3Next PROMPT contract ----
+        # qwen3_next prefill path will transpose mixed_qkv before calling rearrange_mixed_qkv.
+        # Therefore we MUST return (dim, seqlen) here.
+        try:
+            dim = int(weight.size(0))
+            if out is not None and out.dim() == 2:
+                # If some earlier normalization produced (seqlen, dim), flip back.
+                if out.size(1) == dim and out.size(0) != dim:
+                    out = out.transpose(0, 1).contiguous()
+        except Exception:
+            pass
 
+        _q35_dbg("after: causal_conv1d_fn OUT %s | x %s | w %s | conv_states %s | qsl %s",
+                  _tinfo(out), _tinfo(x), _tinfo(weight), _tinfo(conv_states), _tinfo(query_start_loc))
         return out
 
     def _hpu_causal_conv1d_update(
@@ -486,6 +641,38 @@ def _patch_vllm_mamba_causal_conv1d_to_gaudi_pytorch() -> None:
             initial_state_idx=initial_state_idx,
             validate_data=validate_data,
         )
+        # Normalize to (num_tokens, dim) for qwen3_next split().
+        # out = _normalize_mixed_qkv_out(out, weight)
+
+        _q35_dbg("before: causal_conv1d_update OUT %s | x %s | w %s | conv_state %s | qsl %s",
+                 _tinfo(out), _tinfo(x), _tinfo(weight), _tinfo(conv_state), _tinfo(query_start_loc))
+
+        # ---- Qwen3Next DECODE/UPDATE contract ----
+        # qwen3_next.rearrange_mixed_qkv expects 2D input shaped (l, 4096).
+        # If we pass 3D (B, L, 4096), split produces 3D tensors and einops fails.
+        # Therefore: ensure last-dim is 4096 AND flatten to 2D (B*L, 4096).
+        try:
+            dim = int(weight.size(0))
+            if out is not None:
+                if out.dim() == 3:
+                    # (B, dim, L) -> (B, L, dim)
+                    if out.size(1) == dim and out.size(2) != dim:
+                        out = out.permute(0, 2, 1).contiguous()
+                    # (B, L, dim) -> keep
+                    elif out.size(2) == dim:
+                        out = out.contiguous()
+                    # flatten to (B*L, dim)
+                    if out.size(-1) == dim:
+                        out = out.view(-1, dim)
+                elif out.dim() == 2:
+                    # (dim, T) -> (T, dim)
+                    if out.size(0) == dim and out.size(1) != dim:
+                        out = out.transpose(0, 1).contiguous()
+        except Exception:
+            pass
+
+        _q35_dbg("after: causal_conv1d_update OUT %s | x %s | w %s | conv_state %s | qsl %s",
+                 _tinfo(out), _tinfo(x), _tinfo(weight), _tinfo(conv_state), _tinfo(query_start_loc))
 
         return out
 
@@ -519,6 +706,9 @@ def _patch_vllm_mamba_causal_conv1d_to_gaudi_pytorch() -> None:
 
 # Apply early in worker process import
 _patch_vllm_mamba_causal_conv1d_to_gaudi_pytorch()
+
+_patch_qwen3_next_rearrange_debug()
+
 
 def setup_step_profiler(steps):
     if steps is None:

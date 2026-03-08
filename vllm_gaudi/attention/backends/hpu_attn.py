@@ -557,6 +557,9 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
         # Set return shape
         output_shape = query.shape
         if query.dim() == 2:
+#            if attn_metadata.block_mapping is None:
+#                import remote_pdb; remote_pdb.set_trace()
+#                logger.info(">>")
             if attn_metadata.seq_lens_tensor is not None:
                 batch_size = attn_metadata.seq_lens_tensor.shape[0] if not self.use_merged_prefill else 1
             else:

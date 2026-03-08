@@ -10,6 +10,7 @@ import math
 import os
 import sys
 import time
+from collections.abc import Mapping
 from contextlib import suppress
 from tqdm import tqdm
 from dataclasses import dataclass, field, fields
@@ -546,6 +547,129 @@ class HpuKVConnectorModelRunnerMixin(KVConnectorModelRunnerMixin):
         return None, None
 
 
+class _AttnMetadataOverlayDict(dict):
+    """A dict overlay that falls back to a base Mapping for missing keys.
+
+    qwen3_next GDN path requires isinstance(attn_metadata, dict) and indexes
+    attn_metadata[self.prefix]. We must preserve the original base mapping behavior
+    (may be a dict subclass / lazy dict), while allowing us to override some keys
+    (e.g., self-attn entries) with processed metadata for HPU attention.
+    """
+
+    def __init__(self, base: collections.abc.Mapping):
+        super().__init__()
+        self._base = base
+
+    def __getitem__(self, key):
+        if dict.__contains__(self, key):
+            return dict.__getitem__(self, key)
+        return self._base[key]
+
+    def get(self, key, default=None):
+        if dict.__contains__(self, key):
+            return dict.__getitem__(self, key)
+        # base may or may not have .get
+        base_get = getattr(self._base, "get", None)
+        if callable(base_get):
+            return base_get(key, default)
+        return default
+
+    def __contains__(self, key):
+        return dict.__contains__(self, key) or (key in self._base)
+
+
+class _AttnMetadataProxyDict(dict):
+    """Dict proxy:
+    - key lookup delegates to base mapping (for qwen3_next prefix indexing)
+    - attribute access delegates to processed metadata object (for HPU self-attn)
+    """
+    def __init__(self, base: collections.abc.Mapping, md: Any):
+        super().__init__()
+        self._base = base
+        self._md = md
+
+    def __getitem__(self, key):
+        # allow explicit overrides if someone set items on this dict
+        if dict.__contains__(self, key):
+            return dict.__getitem__(self, key)
+        return self._base[key]
+
+    def get(self, key, default=None):
+        if dict.__contains__(self, key):
+            return dict.__getitem__(self, key)
+        base_get = getattr(self._base, "get", None)
+        if callable(base_get):
+            return base_get(key, default)
+        return default
+
+    def __contains__(self, key):
+        try:
+            return dict.__contains__(self, key) or (key in self._base)
+        except Exception:
+            return dict.__contains__(self, key)
+
+    def __iter__(self):
+        # best-effort iteration: prefer base
+        try:
+            return iter(self._base)
+        except Exception:
+            return dict.__iter__(self)
+
+    def __getattr__(self, name):
+        # attribute access goes to processed metadata
+        return getattr(self._md, name)
+
+def _looks_like_attn_md(obj: Any) -> bool:
+    return (obj is not None and hasattr(obj, "is_prompt")
+            and (hasattr(obj, "block_mapping") or hasattr(obj, "slot_mapping")
+                 or hasattr(obj, "seq_lens_tensor") or hasattr(obj, "query_start_loc")))
+
+def _q35_dbg_attnmd_key_presence(logger, md, note: str) -> None:
+    """Log presence of linear_attn keys in attn_metadata mapping (once per proc)."""
+    try:
+        keys = []
+        # try to list keys safely (may be lazy mapping)
+        try:
+            keys = list(md.keys())  # type: ignore[attr-defined]
+        except Exception:
+            try:
+                keys = list(md)
+            except Exception:
+                keys = []
+
+        linear_keys = [k for k in keys if isinstance(k, str) and ("linear_attn" in k)]
+        sample_linear = linear_keys[:5]
+        # check a few canonical keys explicitly
+        probe = [
+            "language_model.model.layers.0.linear_attn",
+            "language_model.model.layers.1.linear_attn",
+            "language_model.model.layers.2.linear_attn",
+        ]
+        presence = {}
+        for p in probe:
+            try:
+                presence[p] = (p in md)
+            except Exception:
+                presence[p] = "err"
+
+        logger.info(
+            "[Q35DBG] attn_metadata key-check(%s): type=%s is_dict=%s num_keys~=%s "
+            "linear_attn_count=%d linear_attn_sample=%s probe=%s",
+            note,
+            type(md).__name__,
+            isinstance(md, dict),
+            len(keys) if keys else "unknown",
+            len(linear_keys),
+            sample_linear,
+            presence,
+        )
+    except Exception as e:
+        try:
+            logger.info("[Q35DBG] attn_metadata key-check(%s) failed: %r", note, e)
+        except Exception:
+            pass
+
+
 class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
 
     def __init__(self, model, vllm_config):
@@ -630,21 +754,69 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
             kwargs.pop('warmup_mode')
         input_ids = kwargs['input_ids']
         model_has_chunked_attention = kwargs.pop('model_has_chunked_attention', False)
-#        if (not self.unified_attn) and ('attn_metadata' in kwargs and not self.pooling_model):
-#            kwargs['attn_metadata'] = self.metadata_processor.process_metadata(kwargs['attn_metadata'],
-#                                                                               input_ids.size(0), input_ids.size(1),
-#                                                                               input_ids.device, self.dtype,
-#                                                                               model_has_chunked_attention)
 
         if (not self.unified_attn) and ('attn_metadata' in kwargs) and (not self.pooling_model):
-            # Qwen3.5 (qwen3_next GDN path) passes dict-like attn_metadata via
-            # forward_context. The HPU metadata processor expects a metadata object
-            # with attributes (e.g. is_prompt). Skip processing for dicts.
             attn_md = kwargs.get('attn_metadata', None)
-            if not isinstance(attn_md, dict):
+
+            # qwen3_next may pass a dict-like attn_metadata keyed by layer prefix.
+            # We must process per-entry so that HPU attention backends get a
+            # fully-populated metadata (e.g. block_mapping).
+            if isinstance(attn_md, collections.abc.Mapping):
+                # 1) First: ensure attribute-based metadata has HPU fields (block_mapping, etc.)
+                base_md = None
+                # common internal holder names seen in gaudi wrappers / qwen dicts
+                for attr in ("_md", "md", "_metadata", "metadata", "_attn_md", "_attn_metadata"):
+                    if hasattr(attn_md, attr):
+                        candidate = getattr(attn_md, attr)
+                        if _looks_like_attn_md(candidate):
+                            base_md = candidate
+                            break
+                if base_md is None and _looks_like_attn_md(attn_md):
+                    base_md = attn_md
+
+                if base_md is not None:
+                    processed_md = self.metadata_processor.process_metadata(
+                        base_md,
+                        input_ids.size(0), input_ids.size(1),
+                        input_ids.device, self.dtype,
+                        model_has_chunked_attention)
+
+                    # If dict-like wrapper can store processed metadata internally, update it.
+                    updated = False
+                    for attr in ("_md", "md", "_metadata", "metadata", "_attn_md", "_attn_metadata"):
+                        if hasattr(attn_md, attr):
+                            try:
+                                setattr(attn_md, attr, processed_md)
+                                updated = True
+                                break
+                            except Exception:
+                                pass
+
+                    # Otherwise, wrap it so:
+                    # - prefix key lookup still works (delegates to base mapping)
+                    # - attribute access uses processed_md (block_mapping not None)
+                    if not updated:
+                        attn_md = _AttnMetadataProxyDict(attn_md, processed_md)
+
+                    # Optional debug: only if decode and Q35 debug enabled
+                    if (os.getenv("VLLM_GAUDI_Q35_DEBUG", "0") == "1"
+                            and hasattr(processed_md, "is_prompt")
+                            and (not bool(processed_md.is_prompt))):
+                        bm = getattr(processed_md, "block_mapping", None)
+                        logger.warning("[Q35DBG] processed attn_md(decode): block_mapping=%s type=%s",
+                                       "set" if bm is not None else "None",
+                                       type(processed_md).__name__)
+
+                # 2) Keep the (possibly wrapped) mapping for the model
+                kwargs['attn_metadata'] = attn_md
+                # NOTE: do NOT early-return via super().forward (Module.forward is _forward_unimplemented).
+                # Fall through to the normal call path at the end of this forward().
+            else:
                 kwargs['attn_metadata'] = self.metadata_processor.process_metadata(
-                    attn_md, input_ids.size(0), input_ids.size(1),
-                    input_ids.device, self.dtype, model_has_chunked_attention)
+                    attn_md,
+                    input_ids.size(0), input_ids.size(1),
+                    input_ids.device, self.dtype,
+                    model_has_chunked_attention)
 
         if self._rotary_prepare_cos_sin is not None:
             self._rotary_prepare_cos_sin(kwargs['positions'], recompute_cos_sin=self.recompute_cos_sin)
