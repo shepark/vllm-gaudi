@@ -3,7 +3,12 @@
 import contextlib
 import gc
 import os
+import time
 import queue
+import math
+import sys
+import types
+import torch.nn.functional as F
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Optional
 
@@ -39,6 +44,670 @@ logger = init_logger()
 
 if TYPE_CHECKING:
     from vllm.v1.core.scheduler import GrammarOutput, SchedulerOutput
+
+# --- Q35 debug helpers ---
+_Q35_DBG = os.getenv("VLLM_GAUDI_Q35_DEBUG", "0") == "1"
+_Q35_DBG_LIMIT = int(os.getenv("VLLM_GAUDI_Q35_DEBUG_LIMIT", "20"))
+_q35_dbg_count = 0
+
+def _q35_dbg(msg: str, *args):
+    global _q35_dbg_count
+    if (not _Q35_DBG) or (_q35_dbg_count >= _Q35_DBG_LIMIT):
+        return
+    _q35_dbg_count += 1
+    logger.info("[Q35DBG %d] " + msg, _q35_dbg_count, *args)
+
+def _tinfo(t):
+    if t is None:
+        return "None"
+    try:
+        return f"shape={tuple(t.shape)} stride={tuple(t.stride())} contig={t.is_contiguous()} dtype={t.dtype} dev={t.device}"
+    except Exception:
+        return repr(t)
+# --- end ---
+
+def _patch_qwen3_next_rearrange_debug():
+    if not _Q35_DBG:
+        return
+    try:
+        import vllm.model_executor.models.qwen3_next as q3n
+    except Exception as e:
+        _q35_dbg("failed to import qwen3_next for debug: %r", e)
+        return
+
+    def _wrap_method(cls):
+        orig = getattr(cls, "rearrange_mixed_qkv", None)
+        if orig is None:
+            return
+        if getattr(orig, "_q35_wrapped", False):
+            return
+
+        def wrapped(self, mixed_qkv, *args, **kwargs):
+            shp = tuple(mixed_qkv.shape) if hasattr(mixed_qkv, "shape") else None
+
+            mode = "decode" if (shp is not None and len(shp) >= 2 and shp[1] == 1) else "prompt?"
+
+            _q35_dbg("rearrange_mixed_qkv ENTER mode=%s prefix=%r mixed_qkv %s",
+                     mode, getattr(self, "prefix", None), _tinfo(mixed_qkv))
+            return orig(self, mixed_qkv, *args, **kwargs)
+
+        wrapped._q35_wrapped = True
+        setattr(cls, "rearrange_mixed_qkv", wrapped)
+
+    for name, obj in vars(q3n).items():
+        if isinstance(obj, type) and hasattr(obj, "rearrange_mixed_qkv"):
+            _wrap_method(obj)
+
+    _q35_dbg("patched rearrange_mixed_qkv debug wrappers in qwen3_next")
+
+
+def _patch_vllm_fla_gated_delta_rule_to_torch() -> None:
+    """Replace CUDA/Triton FLA gated-delta-rule ops with a torch reference on HPU.
+
+    Upstream FLA ops use CUDA contexts and Triton kernels (e.g. wrapper calls
+    torch.cuda.device(...)), which fails on HPU builds without CUDA. :contentReference[oaicite:2]{index=2}
+    Qwen3.5 (qwen3_next) uses these ops for prefill/decode in GDN attention. :contentReference[oaicite:3]{index=3}
+    """
+    try:
+        from vllm.model_executor.layers.fla import ops as ops_mod
+        from vllm.model_executor.layers.fla.ops import chunk as chunk_mod
+        from vllm.model_executor.layers.fla.ops import fused_recurrent as rec_mod
+    except Exception:
+        return
+
+    if getattr(ops_mod, "_VLLM_GAUDI_PATCHED_FLA_GDR", False):
+        return
+
+    def _expand_qk_to_hv(q: torch.Tensor, k: torch.Tensor, hv: int):
+        # q,k: [B,T,H,K] -> [B,T,HV,K] if HV>H (GVA)
+        B, T, H, K = q.shape
+        if hv == H:
+            return q, k
+        if hv % H != 0:
+            raise RuntimeError(f"HV({hv}) must be divisible by H({H})")
+        r = hv // H
+        return q.repeat_interleave(r, dim=2), k.repeat_interleave(r, dim=2)
+
+    def _l2norm(x: torch.Tensor, eps: float = 1e-6):
+        return x * torch.rsqrt((x * x).sum(dim=-1, keepdim=True) + eps)
+
+    def _gdr_torch_impl(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        scale: float | None,
+        initial_state: torch.Tensor | None,
+        output_final_state: bool,
+        cu_seqlens: torch.LongTensor | None = None,
+        use_qk_l2norm_in_kernel: bool = False,
+        inplace_final_state: bool = False,
+        ssm_state_indices: torch.Tensor | None = None,
+        num_accepted_tokens: torch.Tensor | None = None,
+    ):
+        # Shapes (as used by qwen3_next):
+        # q,k: [B,T,H,K], v: [B,T,HV,V], g,beta: [B,T,HV] (or beta: [B,T,HV,V])
+        assert q.dtype == k.dtype == v.dtype, "q/k/v dtypes must match"
+        B, T, H, K = q.shape
+        HV = v.shape[2]
+        Vd = v.shape[3]
+
+        if scale is None:
+            scale = K ** -0.5
+
+        # expand q,k to HV heads if needed (GVA case)
+        q_hv, k_hv = _expand_qk_to_hv(q, k, HV)
+
+        # Output: [B,T,HV,V]
+        out = torch.empty((B, T, HV, Vd), device=v.device, dtype=v.dtype)
+
+        # Decide varlen view
+        if cu_seqlens is None:
+            # equal-length: N == B
+            cu_list = None
+            N = B
+            def _bos_eos(n): return n * T, (n + 1) * T
+        else:
+            # varlen: expected B==1, tokens flattened along T
+            cu_list = cu_seqlens.detach().cpu().tolist()
+            N = len(cu_list) - 1
+            def _bos_eos(n): return cu_list[n], cu_list[n + 1]
+
+        # Prepare initial state access
+        if initial_state is None:
+            # create zero state if missing
+            initial_state = torch.zeros((N, HV, Vd, K), device=v.device, dtype=v.dtype)
+
+        # We'll compute in fp32 for stability (similar intent as kernels)
+        # State tensor may be updated in place if requested.
+        def _get_state_view(n: int):
+            if ssm_state_indices is None:
+                return initial_state[n]
+            idx = int(ssm_state_indices[n].detach().cpu().item())
+            return initial_state[idx]
+
+        # helper to maybe write back
+        def _write_back(n: int, state_fp32: torch.Tensor):
+            if not inplace_final_state:
+                return
+            if ssm_state_indices is None:
+                initial_state[n].copy_(state_fp32.to(initial_state.dtype))
+            else:
+                idx = int(ssm_state_indices[n].detach().cpu().item())
+                initial_state[idx].copy_(state_fp32.to(initial_state.dtype))
+
+        final_states = []  # fp32 states (only when output_final_state and not inplace)
+
+        # Main loop (slow but correctness-first)
+        for n in range(N):
+            bos, eos = _bos_eos(n)
+            if eos <= bos:
+                # keep state as-is
+                if output_final_state and not inplace_final_state:
+                    final_states.append(_get_state_view(n).to(torch.float32))
+                continue
+
+            # state: [HV,V,K]
+            state0 = _get_state_view(n)
+            h = state0.to(torch.float32)
+
+            # token iteration
+            for t in range(bos, eos):
+                bidx = 0 if cu_list is not None else n
+                # [HV,K]
+                qt = q_hv[bidx, t].to(torch.float32)
+                kt = k_hv[bidx, t].to(torch.float32)
+                # [HV,V]
+                vt = v[bidx, t].to(torch.float32)
+                # [HV] or [HV,K]
+                gt = g[bidx, t].to(torch.float32)
+                bt = beta[bidx, t].to(torch.float32)
+
+                if use_qk_l2norm_in_kernel:
+                    qt = _l2norm(qt)
+                    kt = _l2norm(kt)
+                qt = qt * float(scale)
+
+                # decay: h *= exp(g)
+                if gt.dim() == 1:
+                    h = h * torch.exp(gt).view(HV, 1, 1)
+                else:
+                    # per-K decay (rare): gt [HV,K]
+                    h = h * torch.exp(gt).view(HV, 1, K)
+
+                # proj = h @ k  -> [HV,V]
+                proj = torch.einsum("hvk,hk->hv", h, kt)
+                upd = vt - proj
+
+                # beta can be [HV] or [HV,V]
+                if bt.dim() == 1:
+                    upd = upd * bt.view(HV, 1)
+                else:
+                    upd = upd * bt
+
+                # h += upd ⊗ k
+                h = h + torch.einsum("hv,hk->hvk", upd, kt)
+
+                # out = h @ q
+                ot = torch.einsum("hvk,hk->hv", h, qt)
+                out[bidx, t].copy_(ot.to(out.dtype))
+
+            if inplace_final_state:
+                _write_back(n, h)
+            if output_final_state and not inplace_final_state:
+                final_states.append(h)
+
+        if output_final_state:
+            if inplace_final_state:
+                # mimic kernel behavior: return the (mutated) initial_state
+                return out, initial_state
+            # stack fp32 states then cast back to input dtype
+            fs = torch.stack(final_states, dim=0).to(initial_state.dtype)
+            return out, fs
+        return out, None
+
+    # Public replacements matching upstream signatures
+    def chunk_gated_delta_rule_torch(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        scale: float = None,
+        initial_state: torch.Tensor = None,
+        output_final_state: bool = False,
+        cu_seqlens: torch.LongTensor | None = None,
+        use_qk_l2norm_in_kernel: bool = False,
+    ):
+        return _gdr_torch_impl(
+            q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+            initial_state=initial_state, output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens, use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            inplace_final_state=False,
+            ssm_state_indices=None,
+            num_accepted_tokens=None,
+        )
+
+    def fused_recurrent_gated_delta_rule_torch(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor = None,
+        scale: float = None,
+        initial_state: torch.Tensor = None,
+        inplace_final_state: bool = True,
+        cu_seqlens: torch.LongTensor | None = None,
+        ssm_state_indices: torch.Tensor | None = None,
+        num_accepted_tokens: torch.Tensor | None = None,
+        use_qk_l2norm_in_kernel: bool = False,
+    ):
+        if beta is None:
+            beta = torch.ones_like(g, dtype=g.dtype, device=g.device)
+        return _gdr_torch_impl(
+            q=q, k=k, v=v, g=g, beta=beta, scale=scale,
+            initial_state=initial_state, output_final_state=True,
+            cu_seqlens=cu_seqlens, use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            inplace_final_state=inplace_final_state,
+            ssm_state_indices=ssm_state_indices,
+            num_accepted_tokens=num_accepted_tokens,
+        )
+
+    # Patch canonical module functions
+    chunk_mod.chunk_gated_delta_rule = chunk_gated_delta_rule_torch
+    rec_mod.fused_recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule_torch
+    ops_mod.chunk_gated_delta_rule = chunk_gated_delta_rule_torch
+    ops_mod.fused_recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule_torch
+    ops_mod._VLLM_GAUDI_PATCHED_FLA_GDR = True
+
+    # Patch already-imported aliases in qwen3_next/qwen3_5 modules if present
+    for modname in (
+        "vllm.model_executor.models.qwen3_next",
+        "vllm.model_executor.models.qwen3_5",
+    ):
+        try:
+            m = __import__(modname, fromlist=["*"])
+        except Exception:
+            continue
+        if hasattr(m, "fla_chunk_gated_delta_rule"):
+            setattr(m, "fla_chunk_gated_delta_rule", chunk_gated_delta_rule_torch)
+        if hasattr(m, "fused_recurrent_gated_delta_rule"):
+            setattr(m, "fused_recurrent_gated_delta_rule", fused_recurrent_gated_delta_rule_torch)
+
+# Apply early in worker process import (before model execution)
+_patch_vllm_fla_gated_delta_rule_to_torch()
+
+
+def _patch_qwen3_next_gdn_gating_torch_fallback() -> None:
+    """Patch Qwen3.5/Qwen3Next fused_gdn_gating to avoid Triton on HPU.
+
+    qwen3_next defines fused_gdn_gating with a Triton kernel and calls
+    triton.cdiv(...) (via `from vllm.triton_utils import triton`). On Gaudi/HPU
+    this often fails because vllm.triton_utils may provide a placeholder module
+    without cdiv, and Triton kernels aren't intended for HPU anyway.
+
+    Replace fused_gdn_gating with a pure torch implementation:
+      g = -exp(A_log) * softplus(a + dt_bias)
+      beta_output = sigmoid(b)
+    which matches the kernel math (using torch softplus for stability).
+    """
+    try:
+        from vllm.model_executor.models import qwen3_next as q3n
+    except Exception:
+        return
+
+    if getattr(q3n, "_VLLM_GAUDI_PATCHED_GDN_GATING", False):
+        return
+
+    def fused_gdn_gating_torch(
+        A_log: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        dt_bias: torch.Tensor,
+        beta: float = 1.0,
+        threshold: float = 20.0,
+    ):
+        # Promote to fp32 for the same stability intent as the Triton kernel.
+        a_f = a.to(torch.float32)
+        b_f = b.to(torch.float32)
+        A_f = A_log.to(torch.float32)
+        dt_f = dt_bias.to(torch.float32)
+
+        # Broadcast dt_bias / A_log to match a's shape (token_dim..., heads).
+        while dt_f.dim() < a_f.dim():
+            dt_f = dt_f.unsqueeze(0)
+        while A_f.dim() < a_f.dim():
+            A_f = A_f.unsqueeze(0)
+
+        # softplus(a + dt_bias) with beta/threshold for numerical stability.
+        softplus_x = F.softplus(a_f + dt_f, beta=beta, threshold=threshold)
+        g = -torch.exp(A_f) * softplus_x  # fp32
+        beta_out = torch.sigmoid(b_f).to(b.dtype)
+
+        # Upstream expects (1, tokens, heads) for this call site.
+        if g.dim() == 2:
+            g = g.unsqueeze(0)
+        if beta_out.dim() == 2:
+            beta_out = beta_out.unsqueeze(0)
+        return g, beta_out
+
+    q3n.fused_gdn_gating = fused_gdn_gating_torch
+    q3n._VLLM_GAUDI_PATCHED_GDN_GATING = True
+
+# Apply patch early in worker process import.
+_patch_qwen3_next_gdn_gating_torch_fallback()
+
+
+def _patch_qwen3_next_sparse_moe_block_flatten_hidden_states() -> None:
+    """Make Qwen3NextSparseMoeBlock robust to 3D hidden_states on HPU.
+
+    Upstream Qwen3NextSparseMoeBlock.forward assumes hidden_states is 2D:
+        num_tokens, hidden_dim = hidden_states.shape
+    but on HPU runner we can see 3D tensors (e.g. [B, L, H]) especially in decode.
+    Flatten to 2D, call original forward, then reshape back.
+    """
+    try:
+        from vllm.model_executor.models import qwen3_next as q3n
+    except Exception:
+        return
+
+    if getattr(q3n, "_VLLM_GAUDI_PATCHED_QWEN3NEXT_SPARSE_MOE_3D", False):
+        return
+
+    cls = getattr(q3n, "Qwen3NextSparseMoeBlock", None)
+    if cls is None:
+        return
+
+    orig_forward = cls.forward
+
+    def forward(self, hidden_states: torch.Tensor):
+        # Accept 1D/2D/3D. Flatten all but last dim.
+        orig_shape = hidden_states.shape
+        hidden_dim = hidden_states.shape[-1]
+        hs2d = hidden_states.reshape(-1, hidden_dim)
+        out2d = orig_forward(self, hs2d)
+        return out2d.reshape(orig_shape)
+
+    cls.forward = forward
+    q3n._VLLM_GAUDI_PATCHED_QWEN3NEXT_SPARSE_MOE_3D = True
+
+_patch_qwen3_next_sparse_moe_block_flatten_hidden_states()
+
+
+def _patch_vllm_mamba_causal_conv1d_to_gaudi_pytorch() -> None:
+    """Route vLLM upstream Mamba causal_conv1d ops to Gaudi PyTorch impl.
+
+    Upstream uses Triton kernels via `from vllm.triton_utils import triton`,
+    which is not suitable on HPU and can miss helpers like next_power_of_2/cdiv.
+    vllm-gaudi provides a PyTorch reference implementation; use it on HPU.
+    """
+    try:
+        from vllm.model_executor.layers.mamba.ops import causal_conv1d as cv
+        from vllm_gaudi.ops import causal_conv1d_pytorch as gcv
+    except Exception:
+        return
+
+    # Keep originals so we can detect and patch already-imported aliases.
+    _orig_fn = getattr(cv, "causal_conv1d_fn", None)
+    _orig_upd = getattr(cv, "causal_conv1d_update", None)
+
+    if getattr(cv, "_VLLM_GAUDI_PATCHED_CAUSAL_CONV1D", False):
+        return
+
+    def _normalize_mixed_qkv_out(out: torch.Tensor | None,
+                                weight: torch.Tensor) -> torch.Tensor | None:
+        """Normalize causal_conv1d outputs to shape (num_tokens, dim).
+
+        qwen3_next.rearrange_mixed_qkv() does torch.split(..., dim=-1) with sizes
+        [1024, 1024, 2048], so last-dim must be 4096 (feature dim).
+
+        Our gaudi reference paths can return:
+          - prompt: (dim, L)
+          - decode/update: (B, dim, L) (often L=1)
+        We normalize to:
+          - (L, dim) for prompt
+          - (B*L, dim) for update
+        """
+        if out is None:
+            return None
+        dim = int(weight.size(0))
+
+        # 3D: (B, dim, L) or (B, L, dim) -> (B*L, dim)
+        if out.dim() == 3:
+            if out.size(1) == dim:
+                # (B, dim, L) -> (B, L, dim)
+                out = out.permute(0, 2, 1).contiguous()
+            elif out.size(2) == dim:
+                # already (B, L, dim)
+                out = out.contiguous()
+            else:
+                # unexpected layout; keep as-is (will likely fail loudly later)
+                return out
+
+            # If L == 1, squeeze the L dimension
+            if out.size(1) == 1:
+                return out[:, 0, :]
+            # else flatten tokens
+            return out.view(-1, dim)
+
+        # 2D: (dim, L) or (L, dim) -> (L, dim)
+        if out.dim() == 2:
+            if out.size(0) == dim and out.size(1) != dim:
+                # (dim, L) -> (L, dim)
+                return out.transpose(0, 1).contiguous()
+            # if already (L, dim), just ensure last dim is dim
+            return out
+
+        return out
+
+    # Wrap upstream signatures -> gaudi reference impl.
+    def _hpu_causal_conv1d_fn(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        conv_states: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        cache_indices: torch.Tensor | None = None,
+        has_initial_state: torch.Tensor | None = None,
+        activation: str | None = "silu",
+        pad_slot_id: int = -1,  # ignored (gaudi impl uses PAD_SLOT_ID internally)
+        block_idx_first_scheduled_token: torch.Tensor | None = None,
+        block_idx_last_scheduled_token: torch.Tensor | None = None,
+        initial_state_idx: torch.Tensor | None = None,
+        num_computed_tokens: torch.Tensor | None = None,
+        block_size_to_align: int = 0,
+        metadata=None,
+        validate_data: bool = False,
+    ):
+        # NOTE: gaudi reference impl will raise NotImplementedError if
+        # prefix-caching metadata is provided. For now we assume these are None.
+        # qwen3_next passes conv_state as (B, dim, state_len) (it does transpose(-1, -2)),
+        # while gaudi pytorch ref expects (B, state_len, dim).
+        conv_states_ref = conv_states
+        try:
+            dim = int(weight.size(0))
+            state_len = int(weight.size(1) - 1)
+            if conv_states_ref is not None and conv_states_ref.dim() == 3:
+                # (B, dim, state_len) -> (B, state_len, dim)
+                if conv_states_ref.size(-2) == dim and conv_states_ref.size(-1) == state_len:
+                    conv_states_ref = conv_states_ref.transpose(-1, -2)
+        except Exception:
+            pass
+
+        out = gcv.hpu_causal_conv1d_fn(
+            x,
+            weight,
+            bias,
+            conv_states_ref,
+            query_start_loc,
+            cache_indices=cache_indices,
+            has_initial_state=has_initial_state,
+            activation=activation,
+            block_idx_first_scheduled_token=block_idx_first_scheduled_token,
+            block_idx_last_scheduled_token=block_idx_last_scheduled_token,
+            initial_state_idx=initial_state_idx,
+            num_computed_tokens=num_computed_tokens,
+            block_size_to_align=block_size_to_align,
+            metadata=metadata,
+            validate_data=validate_data,
+            is_prompt=True,
+        )
+        # Normalize to (num_tokens, dim) for qwen3_next split().
+        # out = _normalize_mixed_qkv_out(out, weight)
+        _q35_dbg("before: causal_conv1d_fn OUT %s | x %s | w %s | conv_states %s | qsl %s",
+                  _tinfo(out), _tinfo(x), _tinfo(weight), _tinfo(conv_states), _tinfo(query_start_loc))
+        # ---- Qwen3Next PROMPT contract ----
+        # qwen3_next prefill path will transpose mixed_qkv before calling rearrange_mixed_qkv.
+        # Therefore we MUST return (dim, seqlen) here.
+        try:
+            dim = int(weight.size(0))
+            if out is not None and out.dim() == 2:
+                # If some earlier normalization produced (seqlen, dim), flip back.
+                if out.size(1) == dim and out.size(0) != dim:
+                    out = out.transpose(0, 1).contiguous()
+        except Exception:
+            pass
+
+        _q35_dbg("after: causal_conv1d_fn OUT %s | x %s | w %s | conv_states %s | qsl %s",
+                  _tinfo(out), _tinfo(x), _tinfo(weight), _tinfo(conv_states), _tinfo(query_start_loc))
+        return out
+
+    def _hpu_causal_conv1d_update(
+        x: torch.Tensor,
+        conv_state: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        activation: bool | str | None = None,
+        conv_state_indices: torch.Tensor | None = None,
+        num_accepted_tokens: torch.Tensor | None = None,
+        query_start_loc: torch.Tensor | None = None,
+        max_query_len: int = -1,
+        pad_slot_id: int = -1,  # ignored
+        block_idx_last_scheduled_token: torch.Tensor | None = None,
+        initial_state_idx: torch.Tensor | None = None,
+        validate_data: bool = False,
+    ):
+        # ------------------------------------------------------------------
+        # Layout fix for gaudi PyTorch reference impl:
+        # gcv._flatten_inputs_for_update(query_start_loc=None) expects x shaped
+        # as (batch, dim) or (batch, dim, seqlen), and checks x_3d.size(1)==dim.
+        # If x arrives as (dim, batch) (channel-first), transpose to token-first.
+        # ------------------------------------------------------------------
+        try:
+            dim = int(weight.size(0))
+            if query_start_loc is None:
+                if x is not None and x.dim() == 2:
+                    # channel-first (dim, batch) -> token-first (batch, dim)
+                    if x.size(0) == dim and x.size(1) != dim:
+                        x = x.transpose(0, 1).contiguous()
+                elif x is not None and x.dim() == 3:
+                    # handle common mis-orders:
+                    # (dim, batch, seqlen) -> (batch, dim, seqlen)
+                    if x.size(0) == dim and x.size(1) != dim:
+                        x = x.permute(1, 0, 2).contiguous()
+                    # (batch, seqlen, dim) -> (batch, dim, seqlen)
+                    elif x.size(-1) == dim and x.size(1) != dim:
+                        x = x.permute(0, 2, 1).contiguous()
+            # gaudi update impl expects 3D: (batch, dim, cu_seqlen). For decode,
+            # cu_seqlen is usually 1, but must be present.
+            if x is not None and x.dim() == 2:
+                x = x.unsqueeze(-1)
+        except Exception:
+            pass
+
+        conv_state_ref = conv_state
+        try:
+            dim = int(weight.size(0))
+            state_len = int(weight.size(1) - 1)
+            if conv_state_ref is not None and conv_state_ref.dim() == 3:
+                if conv_state_ref.size(-2) == dim and conv_state_ref.size(-1) == state_len:
+                    conv_state_ref = conv_state_ref.transpose(-1, -2)
+        except Exception:
+            pass
+
+        out = gcv.hpu_causal_conv1d_update(
+            x,
+            conv_state_ref,
+            weight,
+            bias=bias,
+            activation=activation,
+            conv_state_indices=conv_state_indices,
+            num_accepted_tokens=num_accepted_tokens,
+            query_start_loc=query_start_loc,
+            max_query_len=max_query_len,
+            pad_slot_id=pad_slot_id,
+            block_idx_last_scheduled_token=block_idx_last_scheduled_token,
+            initial_state_idx=initial_state_idx,
+            validate_data=validate_data,
+        )
+        # Normalize to (num_tokens, dim) for qwen3_next split().
+        # out = _normalize_mixed_qkv_out(out, weight)
+
+        _q35_dbg("before: causal_conv1d_update OUT %s | x %s | w %s | conv_state %s | qsl %s",
+                 _tinfo(out), _tinfo(x), _tinfo(weight), _tinfo(conv_state), _tinfo(query_start_loc))
+
+        # ---- Qwen3Next DECODE/UPDATE contract ----
+        # qwen3_next.rearrange_mixed_qkv expects 2D input shaped (l, 4096).
+        # If we pass 3D (B, L, 4096), split produces 3D tensors and einops fails.
+        # Therefore: ensure last-dim is 4096 AND flatten to 2D (B*L, 4096).
+        try:
+            dim = int(weight.size(0))
+            if out is not None:
+                if out.dim() == 3:
+                    # (B, dim, L) -> (B, L, dim)
+                    if out.size(1) == dim and out.size(2) != dim:
+                        out = out.permute(0, 2, 1).contiguous()
+                    # (B, L, dim) -> keep
+                    elif out.size(2) == dim:
+                        out = out.contiguous()
+                    # flatten to (B*L, dim)
+                    if out.size(-1) == dim:
+                        out = out.view(-1, dim)
+                elif out.dim() == 2:
+                    # (dim, T) -> (T, dim)
+                    if out.size(0) == dim and out.size(1) != dim:
+                        out = out.transpose(0, 1).contiguous()
+        except Exception:
+            pass
+
+        _q35_dbg("after: causal_conv1d_update OUT %s | x %s | w %s | conv_state %s | qsl %s",
+                 _tinfo(out), _tinfo(x), _tinfo(weight), _tinfo(conv_state), _tinfo(query_start_loc))
+
+        return out
+
+    cv.causal_conv1d_fn = _hpu_causal_conv1d_fn
+    cv.causal_conv1d_update = _hpu_causal_conv1d_update
+    cv._VLLM_GAUDI_PATCHED_CAUSAL_CONV1D = True
+
+    # qwen3_next imports causal_conv1d_fn/update via `from ... import ...`,
+    # so patch the bound symbols in that module as well. :contentReference[oaicite:2]{index=2}
+    for modname in (
+        "vllm.model_executor.models.qwen3_next",
+        "vllm.model_executor.models.qwen3_5",
+    ):
+        try:
+            m = __import__(modname, fromlist=["*"])
+        except Exception:
+            continue
+        if getattr(m, "causal_conv1d_fn", None) is _orig_fn:
+            setattr(m, "causal_conv1d_fn", _hpu_causal_conv1d_fn)
+        if getattr(m, "causal_conv1d_update", None) is _orig_upd:
+            setattr(m, "causal_conv1d_update", _hpu_causal_conv1d_update)
+
+    # Optional: patch any other already-imported aliases.
+    for _, m in list(sys.modules.items()):
+        if m is None:
+            continue
+        if getattr(m, "causal_conv1d_fn", None) is _orig_fn:
+            setattr(m, "causal_conv1d_fn", _hpu_causal_conv1d_fn)
+        if getattr(m, "causal_conv1d_update", None) is _orig_upd:
+            setattr(m, "causal_conv1d_update", _hpu_causal_conv1d_update)
+
+# Apply early in worker process import
+_patch_vllm_mamba_causal_conv1d_to_gaudi_pytorch()
+
+_patch_qwen3_next_rearrange_debug()
 
 
 def setup_step_profiler(steps):
@@ -289,7 +958,7 @@ class HPUWorker(WorkerBase):
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
-    def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
+    def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> float:
         """Allocate GPU KV cache with the specified kv_cache_config."""
 
         # Init kv cache connector here, because it requires
@@ -313,15 +982,17 @@ class HPUWorker(WorkerBase):
         msg = ("Initializing cache engine "
                f"took {m.get_summary_string()}")
         logger.info(msg)
-        self.compile_or_warm_up_model()
+        return self.compile_or_warm_up_model()
 
-    def compile_or_warm_up_model(self) -> None:
+    def compile_or_warm_up_model(self) -> float:
         # Don't run the warmup if the model is already warmed up
+        start_t = time.perf_counter()
         if not getattr(self.model_runner, 'graphed_buckets', None):
             self.model_runner.warmup_model()
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
+        return time.perf_counter() - start_t
 
     def sample_tokens(self, grammar_output: "GrammarOutput|None") -> ModelRunnerOutput | AsyncModelRunnerOutput:
         return self.model_runner.sample_tokens(grammar_output)

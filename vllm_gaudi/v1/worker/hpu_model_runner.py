@@ -10,6 +10,7 @@ import math
 import os
 import sys
 import time
+from collections.abc import Mapping
 from contextlib import suppress
 from tqdm import tqdm
 from dataclasses import dataclass, field, fields
@@ -42,6 +43,7 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.v1.attention.selector import get_attn_backend
+from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 from vllm.config import (VllmConfig, get_layers_from_vllm_config, update_config)
 from vllm.config.multimodal import ImageDummyOptions, VideoDummyOptions
@@ -472,6 +474,47 @@ def apply_model_specific_patches(model_runner):
     patch_llama4_get_attn_scale(model_runner.model)
 
 
+class DictBackedAttentionMetadata(dict):
+    """A dict view over TrimmedAttentionMetadata/AttentionMetadata objects.
+
+    Qwen3.5 (qwen3_next) asserts `isinstance(attn_metadata, dict)`.
+    vllm-gaudi codepaths (e.g. process_metadata) expect attribute access and
+    namedtuple-like APIs (_replace/_asdict/_fields).
+
+    This wrapper satisfies both:
+      - It *is* a dict (passes isinstance(..., dict))
+      - Delegates attribute and namedtuple APIs to the original metadata
+    """
+    def __init__(self, md):
+        self._md = md
+        # Populate dict payload for code that actually indexes into the dict.
+        if hasattr(md, "_asdict"):
+            super().__init__(md._asdict())
+        else:
+            # best-effort: copy public attrs into dict
+            super().__init__({k: getattr(md, k) for k in dir(md)
+                              if not k.startswith("_") and hasattr(md, k)})
+
+    def __getattr__(self, name):
+        return getattr(self._md, name)
+
+    # Preserve namedtuple-like APIs used by gaudi helpers (custom_tuple_replace etc.)
+    def _replace(self, **kwargs):
+        new_md = self._md._replace(**kwargs)
+        return DictBackedAttentionMetadata(new_md)
+
+    def _asdict(self):
+        return self._md._asdict() if hasattr(self._md, "_asdict") else dict(self)
+
+    @property
+    def _fields(self):
+        return getattr(self._md, "_fields", ())
+
+    def __iter__(self):
+        # dict iteration semantics
+        return super().__iter__()
+
+
 class HpuKVConnectorModelRunnerMixin(KVConnectorModelRunnerMixin):
 
     def __init__(self):
@@ -502,6 +545,129 @@ class HpuKVConnectorModelRunnerMixin(KVConnectorModelRunnerMixin):
         if has_kv_transfer_group():
             return get_kv_transfer_group().get_finished(scheduler_output.finished_req_ids)
         return None, None
+
+
+class _AttnMetadataOverlayDict(dict):
+    """A dict overlay that falls back to a base Mapping for missing keys.
+
+    qwen3_next GDN path requires isinstance(attn_metadata, dict) and indexes
+    attn_metadata[self.prefix]. We must preserve the original base mapping behavior
+    (may be a dict subclass / lazy dict), while allowing us to override some keys
+    (e.g., self-attn entries) with processed metadata for HPU attention.
+    """
+
+    def __init__(self, base: collections.abc.Mapping):
+        super().__init__()
+        self._base = base
+
+    def __getitem__(self, key):
+        if dict.__contains__(self, key):
+            return dict.__getitem__(self, key)
+        return self._base[key]
+
+    def get(self, key, default=None):
+        if dict.__contains__(self, key):
+            return dict.__getitem__(self, key)
+        # base may or may not have .get
+        base_get = getattr(self._base, "get", None)
+        if callable(base_get):
+            return base_get(key, default)
+        return default
+
+    def __contains__(self, key):
+        return dict.__contains__(self, key) or (key in self._base)
+
+
+class _AttnMetadataProxyDict(dict):
+    """Dict proxy:
+    - key lookup delegates to base mapping (for qwen3_next prefix indexing)
+    - attribute access delegates to processed metadata object (for HPU self-attn)
+    """
+    def __init__(self, base: collections.abc.Mapping, md: Any):
+        super().__init__()
+        self._base = base
+        self._md = md
+
+    def __getitem__(self, key):
+        # allow explicit overrides if someone set items on this dict
+        if dict.__contains__(self, key):
+            return dict.__getitem__(self, key)
+        return self._base[key]
+
+    def get(self, key, default=None):
+        if dict.__contains__(self, key):
+            return dict.__getitem__(self, key)
+        base_get = getattr(self._base, "get", None)
+        if callable(base_get):
+            return base_get(key, default)
+        return default
+
+    def __contains__(self, key):
+        try:
+            return dict.__contains__(self, key) or (key in self._base)
+        except Exception:
+            return dict.__contains__(self, key)
+
+    def __iter__(self):
+        # best-effort iteration: prefer base
+        try:
+            return iter(self._base)
+        except Exception:
+            return dict.__iter__(self)
+
+    def __getattr__(self, name):
+        # attribute access goes to processed metadata
+        return getattr(self._md, name)
+
+def _looks_like_attn_md(obj: Any) -> bool:
+    return (obj is not None and hasattr(obj, "is_prompt")
+            and (hasattr(obj, "block_mapping") or hasattr(obj, "slot_mapping")
+                 or hasattr(obj, "seq_lens_tensor") or hasattr(obj, "query_start_loc")))
+
+def _q35_dbg_attnmd_key_presence(logger, md, note: str) -> None:
+    """Log presence of linear_attn keys in attn_metadata mapping (once per proc)."""
+    try:
+        keys = []
+        # try to list keys safely (may be lazy mapping)
+        try:
+            keys = list(md.keys())  # type: ignore[attr-defined]
+        except Exception:
+            try:
+                keys = list(md)
+            except Exception:
+                keys = []
+
+        linear_keys = [k for k in keys if isinstance(k, str) and ("linear_attn" in k)]
+        sample_linear = linear_keys[:5]
+        # check a few canonical keys explicitly
+        probe = [
+            "language_model.model.layers.0.linear_attn",
+            "language_model.model.layers.1.linear_attn",
+            "language_model.model.layers.2.linear_attn",
+        ]
+        presence = {}
+        for p in probe:
+            try:
+                presence[p] = (p in md)
+            except Exception:
+                presence[p] = "err"
+
+        logger.info(
+            "[Q35DBG] attn_metadata key-check(%s): type=%s is_dict=%s num_keys~=%s "
+            "linear_attn_count=%d linear_attn_sample=%s probe=%s",
+            note,
+            type(md).__name__,
+            isinstance(md, dict),
+            len(keys) if keys else "unknown",
+            len(linear_keys),
+            sample_linear,
+            presence,
+        )
+    except Exception as e:
+        try:
+            logger.info("[Q35DBG] attn_metadata key-check(%s) failed: %r", note, e)
+        except Exception:
+            pass
 
 
 class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
@@ -588,11 +754,87 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
             kwargs.pop('warmup_mode')
         input_ids = kwargs['input_ids']
         model_has_chunked_attention = kwargs.pop('model_has_chunked_attention', False)
-        if (not self.unified_attn) and ('attn_metadata' in kwargs and not self.pooling_model):
-            kwargs['attn_metadata'] = self.metadata_processor.process_metadata(kwargs['attn_metadata'],
-                                                                               input_ids.size(0), input_ids.size(1),
-                                                                               input_ids.device, self.dtype,
-                                                                               model_has_chunked_attention)
+
+        if (not self.unified_attn) and ('attn_metadata' in kwargs) and (not self.pooling_model):
+            attn_md = kwargs.get('attn_metadata', None)
+
+            # qwen3_next may pass a dict-like attn_metadata keyed by layer prefix.
+            # We must process per-entry so that HPU attention backends get a
+            # fully-populated metadata (e.g. block_mapping).
+            if isinstance(attn_md, collections.abc.Mapping):
+                # 1) First: ensure attribute-based metadata has HPU fields (block_mapping, etc.)
+                base_md = None
+
+                # Qwen3.5 dict wrapper stores the self-attn/default metadata in
+                # `_default_md`, while keeping linear_attn on `_gdn_md`.
+                if isinstance(attn_md, _Qwen3AttnMetadataDict):
+                    candidate = attn_md.get_default_md()
+                    if _looks_like_attn_md(candidate):
+                        base_md = candidate
+
+                # common internal holder names seen in gaudi wrappers / qwen dicts
+                if base_md is None:
+                    for attr in ("_default_md", "_md", "md", "_metadata",
+                                 "metadata", "_attn_md", "_attn_metadata"):
+                        if hasattr(attn_md, attr):
+                            candidate = getattr(attn_md, attr)
+                            if _looks_like_attn_md(candidate):
+                                base_md = candidate
+                                break
+
+                if base_md is None and _looks_like_attn_md(attn_md):
+                    base_md = attn_md
+
+                if base_md is not None:
+                    processed_md = self.metadata_processor.process_metadata(
+                        base_md,
+                        input_ids.size(0), input_ids.size(1),
+                        input_ids.device, self.dtype,
+                        model_has_chunked_attention)
+
+                    # If dict-like wrapper can store processed metadata internally, update it.
+                    updated = False
+
+                    if isinstance(attn_md, _Qwen3AttnMetadataDict):
+                        attn_md.set_default_md(processed_md)
+                        updated = True
+                    else:
+                        for attr in ("_default_md", "_md", "md", "_metadata",
+                                     "metadata", "_attn_md", "_attn_metadata"):
+                            if hasattr(attn_md, attr):
+                                try:
+                                    setattr(attn_md, attr, processed_md)
+                                    updated = True
+                                    break
+                                except Exception:
+                                    pass
+
+                    # Otherwise, wrap it so:
+                    # - prefix key lookup still works (delegates to base mapping)
+                    # - attribute access uses processed_md (block_mapping not None)
+                    if not updated:
+                        attn_md = _AttnMetadataProxyDict(attn_md, processed_md)
+
+                    # Optional debug: only if decode and Q35 debug enabled
+                    if (os.getenv("VLLM_GAUDI_Q35_DEBUG", "0") == "1"
+                            and hasattr(processed_md, "is_prompt")
+                            and (not bool(processed_md.is_prompt))):
+                        bm = getattr(processed_md, "block_mapping", None)
+                        logger.warning("[Q35DBG] processed attn_md(decode): block_mapping=%s type=%s",
+                                       "set" if bm is not None else "None",
+                                       type(processed_md).__name__)
+
+                # 2) Keep the (possibly wrapped) mapping for the model
+                kwargs['attn_metadata'] = attn_md
+                # NOTE: do NOT early-return via super().forward (Module.forward is _forward_unimplemented).
+                # Fall through to the normal call path at the end of this forward().
+            else:
+                kwargs['attn_metadata'] = self.metadata_processor.process_metadata(
+                    attn_md,
+                    input_ids.size(0), input_ids.size(1),
+                    input_ids.device, self.dtype,
+                    model_has_chunked_attention)
+
         if self._rotary_prepare_cos_sin is not None:
             self._rotary_prepare_cos_sin(kwargs['positions'], recompute_cos_sin=self.recompute_cos_sin)
         attn_meta = kwargs.pop('attn_metadata', None)
@@ -780,6 +1022,45 @@ def with_thread_limits():
         return wrapper
 
     return decorator
+
+
+class _Qwen3AttnMetadataDict(dict):
+    """dict-like mapping: prefix -> (GDNAttentionMetadata or regular attn metadata).
+
+    qwen3_next uses a dict in forward_context.attn_metadata and indexes it with
+    module-specific prefixes. For Qwen3.5:
+      - linear_attn expects GDNAttentionMetadata
+      - normal attention backends expect metadata with seq_lens_tensor, etc.
+
+    The regular/default metadata must be replaceable after gaudi post-processes
+    it (e.g. to populate block_mapping for decode). Keep the GDN branch stable,
+    but allow the non-linear branch to be updated in-place.
+    """
+    def __init__(self, gdn_md: GDNAttentionMetadata, default_md: Any):
+        super().__init__()
+        self._gdn_md = gdn_md
+        self._default_md = default_md
+
+    def get_default_md(self) -> Any:
+        return self._default_md
+
+    def set_default_md(self, md: Any) -> None:
+        self._default_md = md
+
+    def _select(self, key):
+        if isinstance(key, str) and ("linear_attn" in key):
+            return self._gdn_md
+        return self._default_md
+
+    def __getitem__(self, key):
+        return self._select(key)
+
+    def __missing__(self, key):
+        return self._select(key)
+
+    # Some code may use `.get()`; make it consistent with __getitem__/__missing__.
+    def get(self, key, default=None):
+        return self._select(key)
 
 
 class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
@@ -1041,6 +1322,152 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.is_causal = False
         assert not (self.unified_attn and not self.use_contiguous_pa), 'Unified attn requires contiguous_pa!'
         assert not (self.unified_attn and not self.use_merged_prefill), 'Unified attn requires merged_prefill!'
+
+    def _build_gdn_attn_metadata_from_trimmed(self, md) -> GDNAttentionMetadata:
+        """Build vLLM-upstream GDNAttentionMetadata from gaudi TrimmedAttentionMetadata.
+
+        This is a minimal, correctness-first builder for the common (non-spec) path.
+        """
+        # Useful fallbacks when query_start_loc is missing/None or inconsistent.
+        slot_mapping = getattr(md, "slot_mapping", None)
+        slot_n = None
+        if slot_mapping is not None and hasattr(slot_mapping, "numel"):
+            try:
+                slot_n = int(slot_mapping.numel())
+            except Exception:
+                slot_n = None
+
+        # query_start_loc: shape [B+1]
+        # NOTE: vllm-gaudi may leave query_start_loc(_p) as None unless
+        # num_mamba_layers > 0. Qwen3.5 GDN attention still needs it, so
+        # derive it from seq_lens/context_lens when missing.
+        qsl = getattr(md, "query_start_loc", None)
+        if qsl is None:
+            qsl = getattr(md, "query_start_loc_p", None)
+
+        # Derive query_start_loc if still missing/None.
+        if qsl is None:
+            seq_lens_tensor = getattr(md, "seq_lens_tensor", None)
+            ctx_lens_tensor = getattr(md, "context_lens_tensor", None)
+
+            if seq_lens_tensor is None:
+                # Last resort: use slot_mapping length as total tokens for a single seq.
+                if slot_n is None or slot_n == 0:
+                    raise RuntimeError(
+                        "TrimmedAttentionMetadata is missing query_start_loc and "
+                        "seq_lens_tensor; cannot derive query_start_loc"
+                    )
+                qsl = torch.tensor([0, slot_n], dtype=torch.int32, device=getattr(slot_mapping, "device", "cpu"))
+            else:
+                # Heuristic: some metadata variants already store query lengths in seq_lens_tensor.
+                if ctx_lens_tensor is None:
+                    qlens = seq_lens_tensor.to(torch.int32)
+                else:
+                    qlens = (seq_lens_tensor - ctx_lens_tensor).to(torch.int32)
+                    qlens = torch.clamp(qlens, min=0)
+                    # If subtraction yields all zeros but seq_lens_tensor is non-zero, treat seq_lens_tensor as qlens.
+                    try:
+                        if int(qlens.detach().cpu().sum().item()) == 0 and int(seq_lens_tensor.detach().cpu().sum().item()) > 0:
+                            qlens = seq_lens_tensor.to(torch.int32)
+                    except Exception:
+                        pass
+
+                # If we have slot_mapping and totals mismatch, force first seq to cover slot_n.
+                if slot_n is not None and slot_n > 0:
+                    try:
+                        qsum = int(qlens.detach().cpu().sum().item())
+                        if qsum != slot_n:
+                            qlens = torch.zeros_like(qlens, dtype=torch.int32)
+                            qlens[0] = slot_n
+                    except Exception:
+                        pass
+
+                qsl = torch.zeros(
+                    qlens.numel() + 1,
+                    dtype=torch.int32,
+                    device=seq_lens_tensor.device,
+                )
+                qsl[1:] = torch.cumsum(qlens, dim=0)
+
+        # Compute query lengths on CPU (avoid device scalar ops)
+        qsl_cpu = qsl.detach().cpu()
+        qlens_cpu = qsl_cpu[1:] - qsl_cpu[:-1]
+
+        # If qsl still results in 0 tokens but slot_mapping says otherwise, fix it.
+        if slot_n is not None and slot_n > 0:
+            try:
+                if int(qsl_cpu[-1].item()) == 0:
+                    qsl = torch.tensor([0, slot_n], dtype=torch.int32, device=qsl.device)
+                    qsl_cpu = qsl.detach().cpu()
+                    qlens_cpu = qsl_cpu[1:] - qsl_cpu[:-1]
+            except Exception:
+                pass
+
+        # Decide prompt vs decode using md.is_prompt when available.
+        is_prompt = getattr(md, "is_prompt", False)
+        if isinstance(is_prompt, torch.Tensor):
+            is_prompt = bool(is_prompt.detach().cpu().item())
+
+        num_actual_tokens = int(qsl_cpu[-1].item())
+
+        if is_prompt:
+            # prefill batch: treat all >0 query_lens as prefill
+            num_prefills = int((qlens_cpu > 0).sum().item())
+            num_prefill_tokens = num_actual_tokens
+            num_decodes = 0
+            num_decode_tokens = 0
+        else:
+            # decode batch: treat all >0 query_lens as decode (normally all ones)
+            num_decodes = int((qlens_cpu > 0).sum().item())
+            num_decode_tokens = num_actual_tokens
+            num_prefills = 0
+            num_prefill_tokens = 0
+
+        # Final safety: if we have actual tokens, ensure one of the branches is taken.
+        if num_actual_tokens > 0 and num_prefills == 0 and num_decodes == 0:
+            if is_prompt:
+                num_prefills = 1
+                num_prefill_tokens = num_actual_tokens
+            else:
+                num_decodes = 1
+                num_decode_tokens = num_actual_tokens
+
+        context_lens_tensor = getattr(md, "context_lens_tensor", None)
+        has_initial_state = None
+        if num_prefills > 0 and context_lens_tensor is not None:
+            has_initial_state = (context_lens_tensor > 0)
+
+        # For non-spec path, upstream sets non_spec_state_indices_tensor from block_table[:,0].
+        # On gaudi we already have state_indices_tensor that serves the same purpose.
+        non_spec_state_indices_tensor = getattr(md, "state_indices_tensor", None)
+        if non_spec_state_indices_tensor is None:
+            # fallback: [0..B-1]
+            B = int(qlens_cpu.numel())
+            non_spec_state_indices_tensor = torch.arange(
+                B, dtype=torch.int32, device=qsl.device
+            )
+
+        return GDNAttentionMetadata(
+            num_prefills=num_prefills,
+            num_prefill_tokens=num_prefill_tokens,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            num_spec_decodes=0,
+            num_spec_decode_tokens=0,
+            num_actual_tokens=num_actual_tokens,
+            has_initial_state=has_initial_state,
+            spec_query_start_loc=None,
+            non_spec_query_start_loc=qsl,
+            spec_state_indices_tensor=None,
+            non_spec_state_indices_tensor=non_spec_state_indices_tensor,
+            spec_sequence_masks=None,
+            spec_token_indx=None,
+            non_spec_token_indx=None,
+            num_accepted_tokens=None,
+            nums_dict=None,
+            batch_ptr=None,
+            token_chunk_offset_ptr=None,
+        )
 
     def _make_buffer(self, *size: Union[int, torch.SymInt], dtype: torch.dtype, numpy: bool = True) -> CpuGpuBuffer:
         return CpuGpuBuffer(*size, dtype=dtype, device=self.device, pin_memory=self.pin_memory, with_numpy=numpy)
@@ -2003,12 +2430,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             target_bs * target_seq <= self.max_num_tokens
 
     def _get_attention_group_id_for_hybrid(self):
-        if self.num_mamba_layers == 0 or len(self.kv_cache_config.kv_cache_groups) == 0:
+        if len(self.kv_cache_config.kv_cache_groups) == 0:
             return 0
 
         for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
             if isinstance(group.kv_cache_spec, AttentionSpec):
                 return gid
+
+        # fallback: if no AttentionSpec group is found, keep legacy behavior
+        return 0
 
     def _extract_prefill_batch_contents(self, num_prefills, num_decodes, num_scheduled_tokens, warmup=False):
         # DECODES are the first num_decodes REQUESTS.
@@ -2997,6 +3427,26 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         if not seen and not warmup_mode:
             logger.warning("Configuration: %s was not warmed-up!", cfg)
 
+    def _unwrap_model_for_introspection(self, m, max_depth: int = 8):
+        cur = m
+        for _ in range(max_depth):
+            if cur is None:
+                break
+            nxt = None
+            for attr in ("model", "module", "base_model", "language_model"):
+                if hasattr(cur, attr):
+                    nxt = getattr(cur, attr)
+                    break
+            if nxt is None or nxt is cur:
+                break
+            cur = nxt
+        return cur
+
+    def _needs_dict_attn_metadata(self) -> bool:
+        base = self._unwrap_model_for_introspection(self.model)
+        name = f"{type(base).__module__}.{type(base).__name__}".lower()
+        return ("qwen3_next" in name) or ("qwen3_5" in name)
+
     def _execute_model_generic(self,
                                token_ids,
                                position_ids,
@@ -3028,6 +3478,17 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         if self.model_has_chunked_attention:
             additional_kwargs.update({"model_has_chunked_attention": True})
         trimmed_attn_metadata = attn_metadata if self.unified_attn else trim_attn_metadata(attn_metadata)
+
+        # Keep gaudi internal metadata object unchanged.
+        model_attn_metadata = trimmed_attn_metadata
+
+        # Qwen3.5 (qwen3_next) requires forward_context.attn_metadata to be:
+        #   dict[prefix -> (GDNAttentionMetadata for linear_attn, regular metadata otherwise)]
+        # See qwen3_next._forward_core: assert dict, then index by self.prefix. :contentReference[oaicite:2]{index=2}
+        if self._needs_dict_attn_metadata():
+            gdn_md = self._build_gdn_attn_metadata_from_trimmed(trimmed_attn_metadata)
+            model_attn_metadata = _Qwen3AttnMetadataDict(gdn_md, trimmed_attn_metadata)
+
         if self.is_driver_worker:
             model_event_name = ("model_forward_"
                                 f"bs{batch_size}_"
@@ -3039,7 +3500,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         with self.profiler.record_event('internal', model_event_name):
             hidden_states = self.model.forward(input_ids=token_ids,
                                                positions=position_ids,
-                                               attn_metadata=trimmed_attn_metadata,
+                                               attn_metadata=model_attn_metadata,
                                                kv_caches=kv_caches,
                                                inputs_embeds=inputs_embeds,
                                                model_mm_kwargs=model_mm_kwargs,
@@ -5274,7 +5735,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
     def warmup_multimodal_graphs(self, buckets):
 
         phase = 'Graph/Multimodal'
-        from vllm.multimodal.budget import MultiModalBudget
+        from vllm.multimodal.encoder_budget import MultiModalBudget
         self.mm_budget = MultiModalBudget(
             self.vllm_config,
             self.mm_registry,
