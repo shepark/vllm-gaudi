@@ -256,6 +256,30 @@ def hpu_causal_conv1d_update(
     activation = _normalize_activation(activation)
     dim = weight.size(0)
 
+    # Fast path for decode/update without query_start_loc.
+    #
+    # qwen3_next decode calls causal_conv1d_update(...) without query_start_loc.
+    # The gaudi wrapper already normalizes x to token-first/batched layout
+    # ((batch, dim) or (batch, dim, 1)).
+    #
+    # Avoid the reference impl's flatten -> synthetic qsl -> lens check ->
+    # reshape round-trip here, because that path is hitting an HPU reshape
+    # failure in compiled execution for text-only decode.
+    if query_start_loc is None:
+        return hpu_causal_conv1d_fn_update(
+            x,
+            weight,
+            bias,
+            conv_state,
+            None,
+            cache_indices=conv_state_indices,
+            has_initial_state=None,
+            activation=activation,
+            metadata=None,
+            validate_data=validate_data,
+            is_prompt=False,
+        )
+
     flat_x, qsl, reshape_spec = _flatten_inputs_for_update(x, query_start_loc, dim)
 
     result = hpu_causal_conv1d_fn_update(
@@ -280,7 +304,7 @@ def hpu_causal_conv1d_fn_update(
     weight: torch.Tensor,
     bias: torch.Tensor | None,
     conv_states: torch.Tensor | None,
-    query_start_loc: torch.Tensor,
+    query_start_loc: torch.Tensor | None,
     cache_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
     activation: str | None = "silu",
@@ -312,48 +336,91 @@ def hpu_causal_conv1d_fn_update(
     if conv_states.device != x_work.device:
         raise ValueError("'conv_states' must reside on the same device as 'x'.")
 
-    # GPU-optimized: Keep all tensors on GPU, no CPU transfers
-    # Don't use .to('cuda') during graph capture - use the device from x_work
-    qsl = _ensure_query_start_loc(query_start_loc)
-    assert qsl is not None
+    dim_w = int(weight_work.size(0))
 
-    # Keep on GPU - compute sequence info using tensor operations
-    padded_batch = qsl.numel() - 1
+    if query_start_loc is None:
+        # Direct decode/update path. Accept common layouts and normalize to:
+        #   x_work: (batch, dim, cu_seqlen)
+        if x_work.dim() == 2:
+            # (batch, dim) -> (batch, dim, 1)
+            if x_work.size(1) == dim_w:
+                x_work = x_work.unsqueeze(-1)
+            # (dim, batch) -> (batch, dim, 1)
+            elif x_work.size(0) == dim_w and x_work.size(1) != dim_w:
+                x_work = x_work.transpose(0, 1).contiguous().unsqueeze(-1)
+            else:
+                raise ValueError(
+                    f"Unexpected 2D x shape {tuple(x_work.shape)} for dim={dim_w}"
+                )
+            padded_batch = int(x_work.size(0))
 
-    # The update path expects x_work to be 3D: (padded_batch, dim, cu_seqlen).
-    # However, _flatten_inputs_for_update() may return a 2D "flat" tensor.
-    # Normalize 2D -> 3D here.
-    if x_work.dim() == 2:
-        dim_w = int(weight_work.size(0))
-        # Accept (dim, total_tokens) or (total_tokens, dim)
-        if x_work.size(0) == dim_w:
-            flat = x_work
-        elif x_work.size(1) == dim_w:
-            flat = x_work.transpose(0, 1).contiguous()
+        elif x_work.dim() == 3:
+            # already (batch, dim, L)
+            if x_work.size(1) == dim_w:
+                pass
+            # (dim, batch, L) -> (batch, dim, L)
+            elif x_work.size(0) == dim_w and x_work.size(1) != dim_w:
+                x_work = x_work.permute(1, 0, 2).contiguous()
+            # (batch, L, dim) -> (batch, dim, L)
+            elif x_work.size(2) == dim_w and x_work.size(1) != dim_w:
+                x_work = x_work.permute(0, 2, 1).contiguous()
+            else:
+                raise ValueError(
+                    f"Unexpected 3D x shape {tuple(x_work.shape)} for dim={dim_w}"
+                )
+            padded_batch = int(x_work.size(0))
         else:
             raise ValueError(
-                f"Unexpected x shape {tuple(x_work.shape)} for dim={dim_w}"
+                f"Expected 2D or 3D x_work for decode/update, got {x_work.dim()}D"
             )
+    else:
+        # GPU-optimized: Keep all tensors on GPU, no CPU transfers
+        # Don't use .to('cuda') during graph capture - use the device from x_work
+        qsl = _ensure_query_start_loc(query_start_loc)
+        assert qsl is not None
 
-        lens = (qsl[1:] - qsl[:-1])
-        if lens.numel() == 0:
-            raise ValueError("Empty query_start_loc for causal_conv1d update.")
-        # Reference impl currently assumes uniform length across sequences.
-        if not torch.all(lens == lens[0]):
-            raise NotImplementedError(
-                "Varlen update is not supported in the PyTorch reference implementation."
-            )
-        L = int(lens[0].item())
-        total_tokens = int(flat.size(1))
-        if L <= 0:
-            raise ValueError(f"Invalid per-seq length {L} from query_start_loc.")
-        if total_tokens != padded_batch * L:
-            raise ValueError(
-                f"Token count mismatch: total_tokens={total_tokens} vs "
-                f"padded_batch*L={padded_batch}*{L}={padded_batch*L}"
-            )
-        # (dim, padded_batch*L) -> (padded_batch, dim, L)
-        x_work = flat.view(dim_w, padded_batch, L).permute(1, 0, 2).contiguous()
+        # Keep on GPU - compute sequence info using tensor operations
+        padded_batch = qsl.numel() - 1
+
+        # The update path expects x_work to be 3D: (padded_batch, dim, cu_seqlen).
+        # However, _flatten_inputs_for_update() may return a 2D "flat" tensor.
+        # Normalize 2D -> 3D here.
+        if x_work.dim() == 2:
+            # Accept (dim, total_tokens) or (total_tokens, dim)
+            if x_work.size(0) == dim_w:
+                flat = x_work
+            elif x_work.size(1) == dim_w:
+                flat = x_work.transpose(0, 1).contiguous()
+            else:
+                raise ValueError(
+                    f"Unexpected x shape {tuple(x_work.shape)} for dim={dim_w}"
+                )
+
+            lens = (qsl[1:] - qsl[:-1])
+            if lens.numel() == 0:
+                raise ValueError("Empty query_start_loc for causal_conv1d update.")
+
+            # Reference impl currently assumes uniform length across sequences.
+            if not torch.all(lens == lens[0]):
+                raise NotImplementedError(
+                    "Varlen update is not supported in the PyTorch reference "
+                    "implementation."
+                )
+
+            L = int(lens[0].item())
+            total_tokens = int(flat.size(1))
+            if L <= 0:
+                raise ValueError(
+                    f"Invalid per-seq length {L} from query_start_loc."
+                )
+            if total_tokens != padded_batch * L:
+                raise ValueError(
+                    f"Token count mismatch: total_tokens={total_tokens} vs "
+                    f"padded_batch*L={padded_batch}*{L}={padded_batch*L}"
+                )
+
+            # (dim, padded_batch*L) -> (padded_batch, dim, L)
+            x_work = flat.view(dim_w, padded_batch, L).permute(1, 0, 2).contiguous()
 
     if x_work.dim() != 3:
         raise ValueError(f"Expected 3D x_work, got {x_work.dim()}D")

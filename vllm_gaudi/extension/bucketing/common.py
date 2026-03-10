@@ -455,17 +455,24 @@ def generate_buckets(bs_range,
     filters = get_filters(is_prompt, use_merged_prefill, use_contiguous_pa)
     corrector = get_corrector(is_prompt, use_contiguous_pa)
 
+    print(f">> is_prompt? {is_prompt}")
+
     if file_buckets:
         for bs, query, blocks in file_buckets:
             if all(bucket_filter(bs, query, blocks) for bucket_filter in filters):
                 buckets.add(corrector(bs, query, blocks))
     else:
+        print(f">> bs_range:{bs_range}, ctx_range:{ctx_range}")
         for bs_idx, bs in enumerate(bs_range):
             for ctx_idx, ctx in enumerate(ctx_range):
                 local_buckets = expand_to_neighbor_buckets(bs_idx, bs_range, ctx_idx, ctx_range,
                                                            max_num_batched_tokens) if not is_prompt else {(bs, ctx)}
                 buckets_2d.update(local_buckets)
         max_ctx = max(ctx for _, ctx in buckets_2d)
+
+        print(f">> buckets_2d:{buckets_2d}")
+        print(f">> max_ctx:{max_ctx}, query_range:{query_range}")
+
         for bs, ctx in buckets_2d:
             is_max_ctx = ctx == max_ctx
             for query in query_range:
@@ -473,9 +480,14 @@ def generate_buckets(bs_range,
                     bs, query, edge_ctx = get_max_bucket_per_query(bs, query)
                     if is_ctx_allowed(edge_ctx):
                         ctx = edge_ctx
+
+                print(f">> filters:{filters}, (bs,query,ctx):{bs},{query},{ctx}")
                 if all(bucket_filter(bs, query, ctx) for bucket_filter in filters):
                     buckets.add(corrector(bs, query, ctx))
+                    print(f">> add buckets:{buckets}")
+
     if not buckets:
+        print(">> no buckets !")
         phase = 'prompt' if is_prompt else 'decode'
         for bucket in omitted_buckets:
             logger().error(bucket)
@@ -483,6 +495,8 @@ def generate_buckets(bs_range,
             "Generated 0 " + phase +
             " buckets. Please use default exponential bucketing, VLLM_EXPONENTIAL_BUCKETING=true or generate linear warmup flags according to README"
         )
+
+    print(f">> final buckets:{buckets}")
 
     return sorted(buckets)
 

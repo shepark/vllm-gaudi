@@ -764,13 +764,24 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
             if isinstance(attn_md, collections.abc.Mapping):
                 # 1) First: ensure attribute-based metadata has HPU fields (block_mapping, etc.)
                 base_md = None
+
+                # Qwen3.5 dict wrapper stores the self-attn/default metadata in
+                # `_default_md`, while keeping linear_attn on `_gdn_md`.
+                if isinstance(attn_md, _Qwen3AttnMetadataDict):
+                    candidate = attn_md.get_default_md()
+                    if _looks_like_attn_md(candidate):
+                        base_md = candidate
+
                 # common internal holder names seen in gaudi wrappers / qwen dicts
-                for attr in ("_md", "md", "_metadata", "metadata", "_attn_md", "_attn_metadata"):
-                    if hasattr(attn_md, attr):
-                        candidate = getattr(attn_md, attr)
-                        if _looks_like_attn_md(candidate):
-                            base_md = candidate
-                            break
+                if base_md is None:
+                    for attr in ("_default_md", "_md", "md", "_metadata",
+                                 "metadata", "_attn_md", "_attn_metadata"):
+                        if hasattr(attn_md, attr):
+                            candidate = getattr(attn_md, attr)
+                            if _looks_like_attn_md(candidate):
+                                base_md = candidate
+                                break
+
                 if base_md is None and _looks_like_attn_md(attn_md):
                     base_md = attn_md
 
@@ -783,14 +794,20 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
 
                     # If dict-like wrapper can store processed metadata internally, update it.
                     updated = False
-                    for attr in ("_md", "md", "_metadata", "metadata", "_attn_md", "_attn_metadata"):
-                        if hasattr(attn_md, attr):
-                            try:
-                                setattr(attn_md, attr, processed_md)
-                                updated = True
-                                break
-                            except Exception:
-                                pass
+
+                    if isinstance(attn_md, _Qwen3AttnMetadataDict):
+                        attn_md.set_default_md(processed_md)
+                        updated = True
+                    else:
+                        for attr in ("_default_md", "_md", "md", "_metadata",
+                                     "metadata", "_attn_md", "_attn_metadata"):
+                            if hasattr(attn_md, attr):
+                                try:
+                                    setattr(attn_md, attr, processed_md)
+                                    updated = True
+                                    break
+                                except Exception:
+                                    pass
 
                     # Otherwise, wrap it so:
                     # - prefix key lookup still works (delegates to base mapping)
@@ -1014,17 +1031,29 @@ class _Qwen3AttnMetadataDict(dict):
     module-specific prefixes. For Qwen3.5:
       - linear_attn expects GDNAttentionMetadata
       - normal attention backends expect metadata with seq_lens_tensor, etc.
-    We return the appropriate object based on the key.
+
+    The regular/default metadata must be replaceable after gaudi post-processes
+    it (e.g. to populate block_mapping for decode). Keep the GDN branch stable,
+    but allow the non-linear branch to be updated in-place.
     """
     def __init__(self, gdn_md: GDNAttentionMetadata, default_md: Any):
         super().__init__()
         self._gdn_md = gdn_md
         self._default_md = default_md
 
+    def get_default_md(self) -> Any:
+        return self._default_md
+
+    def set_default_md(self, md: Any) -> None:
+        self._default_md = md
+
     def _select(self, key):
         if isinstance(key, str) and ("linear_attn" in key):
             return self._gdn_md
         return self._default_md
+
+    def __getitem__(self, key):
+        return self._select(key)
 
     def __missing__(self, key):
         return self._select(key)
