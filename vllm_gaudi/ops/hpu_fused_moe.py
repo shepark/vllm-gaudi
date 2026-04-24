@@ -22,8 +22,7 @@ from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
     FusedTopKRouter, )
 from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
     GroupedTopKRouter, )
-from vllm.model_executor.layers.fused_moe.runner.moe_runner_base import (
-    get_layer_from_name, )
+
 from vllm.model_executor.layers.fused_moe.router.router_factory import (
     EMPTY_EPLB_STATE, )
 from vllm.model_executor.layers.fused_moe.router.routing_simulator_router import (
@@ -273,34 +272,24 @@ def patched_fused_moe_forward(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
 ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-    """Patched forward that avoids graph breaks from ForwardContext lookups.
-
-    Instead of calling forward_dispatch (which uses get_layer_from_name,
-    ensure_moe_quant_config_init, and _sequence_parallel_context — all of
-    which access ForwardContext and cause torch.compile graph breaks), we
-    cache the layer reference and call _forward_impl directly.
+    """
+    Patched forward that calls forward_dispatch directly for dp_size==1,
+    bypassing the custom op and _encode_layer_name() to avoid dynamo
+    per-layer string guards that cause recompilation.
     """
     hidden_states, shared_experts_input = self.apply_routed_input_transform(hidden_states)
     hidden_states, og_hidden_dims = self._maybe_pad_hidden_states(shared_experts_input, hidden_states)
 
     if self.moe_config.dp_size == 1:
-        # Cache layer ref to avoid per-forward get_layer_from_name graph break
-        if self._hpu_cached_layer is None:
-            self._hpu_cached_layer = get_layer_from_name(self.layer_name)
-            self._hpu_cached_layer.ensure_moe_quant_config_init()
-
-        # Replicate the remaining forward_dispatch logic that we bypass:
-        # 1. Sync shared experts stream for multi-stream overlap
-        self._maybe_sync_shared_experts_stream(shared_experts_input)
-        # 2. Apply gate if the runner owns it (internal router mode)
-        if self.gate is not None:
-            router_logits, _ = self.gate(hidden_states)
-
-        fused_output = self._forward_impl(self._hpu_cached_layer, hidden_states, router_logits, shared_experts_input)
+        # Call forward_dispatch directly with saved layer reference.
+        # This avoids _encode_layer_name() which accesses self.layer_name,
+        # causing dynamo to create per-layer string guards and recompile.
+        fused_output = self.forward_dispatch(self._hpu_layer_ref, hidden_states, router_logits, shared_experts_input)
     else:
         fused_output = self.forward_entry(hidden_states, router_logits, shared_experts_input, self._encode_layer_name())
 
-    return self._maybe_reduce_output(fused_output, og_hidden_dims)
+    result = self._maybe_reduce_output(fused_output, og_hidden_dims)
+    return self._maybe_add_zero_expert_output(result)
 
 
 def get_compressed_expert_map(expert_map: torch.Tensor) -> str:
@@ -488,20 +477,13 @@ def create_fused_moe_router(
 
 
 # Apply patches
-# Keep runner forward patch compatible with upstream layer_name-based dispatch.
-_orig_default_moe_runner_init = DefaultMoERunner.__init__
 _orig_default_moe_runner_forward = DefaultMoERunner.forward
 
-# When enabled, bypasses the opaque torch.ops.vllm.moe_forward_shared custom
-# op wrapper so that torch.ops.hpu.mixture_of_experts is captured directly in
+# When enabled, bypasses the opaque torch.ops.vllm.moe_forward custom op
+# wrapper so that torch.ops.hpu.mixture_of_experts is captured directly in
 # compiled Synapse graphs instead of running eagerly.
 # Set HPU_FUSED_MOE=0 to disable and fall back to the original path.
 _MOE_COMPILE = os.getenv("HPU_FUSED_MOE", "1") == "1"
-
-
-def _patched_default_moe_runner_init(self, layer_name, *args, **kwargs):
-    self._hpu_cached_layer = None
-    return _orig_default_moe_runner_init(self, layer_name, *args, **kwargs)
 
 
 def _patched_default_moe_runner_forward(self, *args, **kwargs):
@@ -510,9 +492,21 @@ def _patched_default_moe_runner_forward(self, *args, **kwargs):
     return _orig_default_moe_runner_forward(self, *args, **kwargs)
 
 
-DefaultMoERunner.__init__ = _patched_default_moe_runner_init
-
 DefaultMoERunner.forward = _patched_default_moe_runner_forward
+
+# Save FusedMoE layer reference on runner for direct forward_dispatch calls.
+# This lets patched_fused_moe_forward bypass _encode_layer_name() and the
+# custom op for dp_size==1, avoiding dynamo per-layer string guards.
+_orig_fused_moe_init = FusedMoE.__init__
+
+
+def _hpu_fused_moe_init(self, *args, **kwargs):
+    _orig_fused_moe_init(self, *args, **kwargs)
+    if hasattr(self, 'runner'):
+        self.runner._hpu_layer_ref = self
+
+
+FusedMoE.__init__ = _hpu_fused_moe_init
 
 vllm.model_executor.layers.fused_moe.layer.get_compressed_expert_map = \
     get_compressed_expert_map
