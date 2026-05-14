@@ -50,6 +50,12 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.mamba.abstract import MambaBase
+try:
+    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+    _GDN_MAMBA_TYPES = (MambaAttentionBackendEnum.GDN_ATTN, MambaAttentionBackendEnum.LINEAR, "gdn_attention",
+                        "linear_attention")
+except (ImportError, AttributeError):
+    _GDN_MAMBA_TYPES = ("gdn_attention", "linear_attention")
 from vllm.model_executor.layers.vocab_parallel_embedding import (VocabParallelEmbedding)
 from vllm.model_executor.model_loader import get_model, get_model_loader
 from vllm.platforms import current_platform
@@ -5861,8 +5867,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         if self.num_mamba_like_layers > 0 and self._compact_gdn_enabled:
             self._num_gdn_groups = sum(
                 1 for g in kv_cache_config.kv_cache_groups
-                if isinstance(g.kv_cache_spec, MambaSpec) and g.kv_cache_spec.mamba_type in ("gdn_attention",
-                                                                                             "linear_attention"))
+                if isinstance(g.kv_cache_spec, MambaSpec) and g.kv_cache_spec.mamba_type in _GDN_MAMBA_TYPES)
         # Profiling may request more sequences than max_num_seqs
         # (e.g. VLLM_PROFILE_DECODE=16,64 with max_num_seqs=1).
         # Ensure GDN compact tensors and free-list are large enough.
@@ -5897,7 +5902,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     if isinstance(spec, FullAttentionSpec):
                         continue
                     if isinstance(spec, MambaSpec) and \
-                            spec.mamba_type in ("gdn_attention", "linear_attention"):
+                            spec.mamba_type in _GDN_MAMBA_TYPES:
                         continue
                     # Standard Mamba2 or unknown spec — needs raw buffer
                     return True
@@ -5945,7 +5950,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         vc = torch.zeros(kv_cache_shape, dtype=kv_cache_spec.dtype, device=self.device)
                         kv_caches[layer_name] = (kc, vc, None, None)
                     elif isinstance(kv_cache_spec, MambaSpec) and \
-                            kv_cache_spec.mamba_type in ("gdn_attention", "linear_attention") and \
+                            kv_cache_spec.mamba_type in _GDN_MAMBA_TYPES and \
                             self._compact_gdn_enabled:
                         # GDN/linear_attention: compact allocation.
                         # All GDN groups share the same state tensor, so each
@@ -5972,7 +5977,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                 kv_caches[shared_layer] = tuple(state_tensors)
                             break
                     elif isinstance(kv_cache_spec, MambaSpec) and \
-                            kv_cache_spec.mamba_type in ("gdn_attention", "linear_attention"):
+                            kv_cache_spec.mamba_type in _GDN_MAMBA_TYPES:
                         # GDN/linear_attention: non-compact (baseline) allocation
                         # using contiguous tensors with num_blocks+1 slots.
                         if isinstance(kv_caches.get(layer_name), tuple):
@@ -6037,7 +6042,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         vc = torch.zeros(kv_cache_shape, dtype=kv_cache_spec.dtype, device=self.device)
                         kv_caches[layer_name] = (kc, vc, None, None)
                     elif isinstance(kv_cache_spec, MambaSpec) and \
-                            kv_cache_spec.mamba_type in ("gdn_attention", "linear_attention") and \
+                            kv_cache_spec.mamba_type in _GDN_MAMBA_TYPES and \
                             self._compact_gdn_enabled:
                         # GDN/linear_attention: compact allocation.
                         self._compact_gdn_group_ids.add(group_idx)
@@ -6057,7 +6062,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                 kv_caches[shared_layer] = tuple(state_tensors)
                             break
                     elif isinstance(kv_cache_spec, MambaSpec) and \
-                            kv_cache_spec.mamba_type in ("gdn_attention", "linear_attention"):
+                            kv_cache_spec.mamba_type in _GDN_MAMBA_TYPES:
                         # GDN/linear_attention: non-compact (baseline) allocation.
                         if isinstance(kv_caches.get(layer_name), tuple):
                             continue
