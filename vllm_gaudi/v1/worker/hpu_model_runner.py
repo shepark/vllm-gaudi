@@ -50,12 +50,6 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.mamba.abstract import MambaBase
-try:
-    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
-    _GDN_MAMBA_TYPES = (MambaAttentionBackendEnum.GDN_ATTN, MambaAttentionBackendEnum.LINEAR, "gdn_attention",
-                        "linear_attention")
-except (ImportError, AttributeError):
-    _GDN_MAMBA_TYPES = ("gdn_attention", "linear_attention")
 from vllm.model_executor.layers.vocab_parallel_embedding import (VocabParallelEmbedding)
 from vllm.model_executor.model_loader import get_model, get_model_loader
 from vllm.platforms import current_platform
@@ -141,6 +135,14 @@ try:
     from lmcache.integration.vllm.vllm_v1_adapter import LMCacheConnectorMetadata
 except ImportError:
     LMCacheConnectorMetadata = None
+
+_GDN_MAMBA_TYPES: tuple[object, ...] = ("gdn_attention", "linear_attention")
+try:
+    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+    _GDN_MAMBA_TYPES = (MambaAttentionBackendEnum.GDN_ATTN, MambaAttentionBackendEnum.LINEAR, "gdn_attention",
+                        "linear_attention")
+except (ImportError, AttributeError):
+    pass
 
 _TYPE_CACHE: dict[str, dict[str, Any]] = {}
 
